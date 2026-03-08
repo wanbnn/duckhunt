@@ -6,6 +6,7 @@ import re
 import time
 import random
 import configparser
+import sys
 from itertools import cycle
 from urllib.parse import urlparse, parse_qs
 
@@ -757,8 +758,12 @@ async def run_chat_loop():
     with open(MCP_CONFIG_PATH, "w", encoding="utf-8") as f:
         json.dump(mcp_config, f, ensure_ascii=False, indent=2)
 
+    cmd = ducktools_cfg.get("command", "python")
+    if cmd == "python" or cmd.endswith("python.exe") or cmd.endswith("python3"):
+        cmd = sys.executable
+
     server_params = StdioServerParameters(
-        command=ducktools_cfg.get("command", "python"),
+        command=cmd,
         args=ducktools_cfg.get("args", []),
         env={**os.environ, **ducktools_cfg["env"]}
     )
