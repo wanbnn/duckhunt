@@ -202,7 +202,8 @@ class UnifiedLLM:
                 if not system_found:
                     local_messages.insert(0, {"role": "system", "content": tools_injection})
 
-            return self.client.create_chat_completion(
+            # Gera a resposta via yield from para funcionar como generator
+            response_generator = self.client.create_chat_completion(
                 messages=local_messages,
                 # tools=tools, # Desabilitado para garantir resposta
                 # tool_choice=tool_choice,
@@ -210,6 +211,12 @@ class UnifiedLLM:
                 temperature=temperature,
                 stream=stream
             )
+            
+            if stream:
+                yield from response_generator
+            else:
+                yield response_generator
+            return
 
         kwargs = {
             "messages": messages,
