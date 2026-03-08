@@ -183,10 +183,29 @@ class UnifiedLLM:
 
     def create_chat_completion(self, messages, tools=None, tool_choice=None, max_tokens=None, temperature=None, stream=True):
         if self.model_type == "local":
+            # Adaptação para modelos locais:
+            # 1. Injeta definições de ferramentas no prompt do sistema
+            # 2. Não passa 'tools' nativamente para evitar bloqueio na geração do llama-cpp-python
+            local_messages = [m.copy() for m in messages]
+            
+            if tools:
+                tools_list = [t.get('function', {}) for t in tools]
+                tools_injection = f"\n\n### AVAILABLE TOOLS\nUse the <tool_call> format to invoke tools.\nTools Schema:\n{json.dumps(tools_list, indent=2)}"
+                
+                system_found = False
+                for msg in local_messages:
+                    if msg.get('role') == 'system':
+                        msg['content'] = msg.get('content', '') + tools_injection
+                        system_found = True
+                        break
+                
+                if not system_found:
+                    local_messages.insert(0, {"role": "system", "content": tools_injection})
+
             return self.client.create_chat_completion(
-                messages=messages,
-                tools=tools,
-                tool_choice=tool_choice,
+                messages=local_messages,
+                # tools=tools, # Desabilitado para garantir resposta
+                # tool_choice=tool_choice,
                 max_tokens=max_tokens,
                 temperature=temperature,
                 stream=stream
@@ -857,13 +876,13 @@ async def run_chat_loop():
                         console.print(Align.center(farewell))
                         console.print()
                         break
-                    if cmd == '/models':
+                    if cmd in ['/models', '/model', '/modelo']:
                         animated_separator("Seleção de Modelo", "#FF8E53")
                         llm = await gerenciar_modelos(llm)
                         model_name = llm.model_name if llm else None
                         status_bar(model_name, load_config("Agent", "filename"), skills_prompts if skills_prompts else None)
                         continue
-                    if cmd == '/agents':
+                    if cmd in ['/agents', '/agent', '/agente']:
                         animated_separator("Seleção de Agente", "#A55EEA")
                         novo_prompt = gerenciar_agentes(agent_prompt_text)
                         if novo_prompt != agent_prompt_text:
@@ -871,12 +890,12 @@ async def run_chat_loop():
                             messages = [{"role": "system", "content": compor_prompt_sistema(agent_prompt_text, skills_prompts)}]
                             notify_info("Contexto reiniciado com o novo agente.")
                         continue
-                    if cmd == '/skills clear':
+                    if cmd in ['/skills clear', '/skill clear', '/skillsclear', '/skillclear']:
                         skills_prompts = []
                         messages = [{"role": "system", "content": compor_prompt_sistema(agent_prompt_text, skills_prompts)}]
                         notify_info("Skills removidas. Contexto reiniciado.")
                         continue
-                    if cmd == '/skills':
+                    if cmd in ['/skills', '/skill', '/skill']:
                         animated_separator("Skills", "#FFC857")
                         novas = gerenciar_skills()
                         if novas:
