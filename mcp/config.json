@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "ducktools": {
+      "command": ".venv\\Scripts\\python.exe",
+      "args": [
+        "mcp\\ducktools\\server.py"
+      ],
+      "env": {
+        "WORKSPACE_DIR": ""
+      }
+    }
+  }
+}

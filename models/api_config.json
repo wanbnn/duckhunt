@@ -1,0 +1,13 @@
+[
+    {
+        "Azure": {
+            "endpoint": "Example",
+            "api_key": "Example",
+            "deployment": "Example"
+        },
+        "OpenAI": {
+            "api_key": "Example",
+            "model": "Example"
+        }
+    }
+]

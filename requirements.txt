@@ -1,0 +1,4 @@
+rich
+llama-cpp-python
+openai
+mcp
