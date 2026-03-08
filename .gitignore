@@ -2,3 +2,5 @@
 __pycache__
 *.gguf
 config.ini
+api_config.json
+config.json
