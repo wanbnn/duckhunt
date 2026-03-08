@@ -1,4 +1,6 @@
 # DuckHunt - [CLI]
+![hg](https://img.shields.io/badge/-HuggingFace-FDEE21?style=for-the-badge&logo=HuggingFace&logoColor=black)
+![python](https://img.shields.io/badge/Python-FFD43B?style=for-the-badge&logo=python&logoColor=black)
 
 Bem-vindo ao DuckHunt! Este é um projeto focado em interações via CLI (Command Line Interface), envolvendo capacidades de Model Context Protocol (MCP), LLMs, modelos locais ou remotos (como a OpenAI/Azure) e agentes autônomos.
 
