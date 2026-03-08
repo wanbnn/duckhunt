@@ -4,6 +4,8 @@ Bem-vindo ao DuckHunt! Este é um projeto focado em interações via CLI (Comman
 
 Este projeto foi projetado para ser inicializado da maneira mais fácil possível. Nós incluímos scripts automatizados para ambiente Windows e Linux que cuidam da criação de ambientes virtuais (`.venv`) e da instalação de todos os pacotes necessários, para que você possa iniciar a aplicação sem dores de cabeça.
 
+![Demo](output.gif)
+
 ---
 
 ## 🛠️ Pré-requisitos (O que instalar antes de tudo)
