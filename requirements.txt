@@ -2,3 +2,11 @@ rich
 llama-cpp-python
 openai
 mcp
+anthropic
+selenium
+webdriver-manager
+fastapi
+uvicorn
+pydantic
+pywin32
+pygame

@@ -10,7 +10,15 @@ Este projeto foi projetado para ser inicializado da maneira mais fácil possíve
 
 ---
 
-## 🛠️ Pré-requisitos (O que instalar antes de tudo)
+## � Integração com Projetos Externos (API)
+
+O DuckHunt agora pode ser usado como um **servidor de API compatível com OpenAI**! Isso permite que você o integre facilmente em seus projetos **Python** e **Node.js** sem precisar lidar com múltiplos SDKs (Anthropic, Gemini, Azure) ou implementar chamadas de ferramentas MCP manualmente. O DuckHunt gerencia tudo para você.
+
+Veja o guia completo de integração em [INTEGRACAO.md](INTEGRACAO.md).
+
+---
+
+## �🛠️ Pré-requisitos (O que instalar antes de tudo)
 
 Antes de executar os scripts automatizados, você precisa apenas garantir que o básico está no seu sistema.
 
