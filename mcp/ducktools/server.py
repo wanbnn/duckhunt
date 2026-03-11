@@ -15,6 +15,9 @@ MAX_LINES_PER_READ = 400
 MAX_SEARCH_RESULTS = 10
 MAX_CMD_OUTPUT_LENGTH = 3000
 
+# Variável global para manter a sessão do navegador
+_browser_driver = None
+
 mcp = FastMCP("DuckTools MCP")
 
 # --- FUNÇÕES AUXILIARES ---
@@ -198,6 +201,45 @@ def search_codebase(query: str) -> str:
     return "\n".join(results)
 
 @mcp.tool()
+def fetch_webpage(url: str, extract_text: bool = True) -> str:
+    """
+    Busca o conteúdo HTML ou texto de uma URL de forma estática (rápido, sem carregar navegador/Selenium).
+    Use extract_text=True para obter apenas o texto limpo.
+    """
+    import urllib.request
+    from urllib.error import URLError, HTTPError
+    import html
+    import re
+    
+    if not url.startswith("http"): url = "http://" + url
+    req = urllib.request.Request(
+        url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36'}
+    )
+    
+    try:
+        with urllib.request.urlopen(req, timeout=15) as response:
+            html_content = response.read().decode('utf-8', errors='ignore')
+            
+            if not extract_text:
+                limit = MAX_CMD_OUTPUT_LENGTH * 2
+                return html_content[:limit] + ("\n...[HTML TRUNCADO]..." if len(html_content) > limit else "")
+            
+            # Limpeza rápida
+            text = re.sub(r'<(script|style|head).*?>.*?</\1>', ' ', html_content, flags=re.DOTALL | re.IGNORECASE)
+            text = re.sub(r'<[^>]+>', ' ', text)
+            text = html.unescape(text)
+            text = re.sub(r'[ \t]+', ' ', text)
+            text = re.sub(r'\n\s*\n', '\n', text).strip()
+            
+            if len(text) > MAX_CMD_OUTPUT_LENGTH:
+                return text[:MAX_CMD_OUTPUT_LENGTH] + "\n\n...[TEXTO TRUNCADO PARA ECONOMIZAR TOKENS]..."
+            return text
+            
+    except HTTPError as e: return f"Erro HTTP {e.code}: {e.reason}"
+    except URLError as e: return f"Erro de URL: {e.reason}"
+    except Exception as e: return f"Erro inesperado: {str(e)}"
+
+@mcp.tool()
 def execute_command(command: str) -> str:
     """Executa um comando de terminal. A saída é truncada se for muito longa."""
     try:
@@ -244,314 +286,129 @@ def complete_todo(task_id: int) -> str:
             return f"Tarefa {task_id} concluída!"
     return "Tarefa não encontrada."
 
-# --- TOOLS DE SLIDES (APRESENTAÇÕES) ---
+
+# --- TOOLS DE AUTOMAÇÃO DE NAVEGADOR ---
 
 @mcp.tool()
-def manage_slides(action: str, filepath: str, slide_content: str = "", slide_index: int = -1, slide_bg: str = "") -> str:
+def browser_automation(action: str, url: str = "", selector: str = "", by: str = "css", text: str = "", script: str = "") -> str:
     """
-    Gerencia apresentações de slides em HTML com suporte a estilos avançados.
+    Automação de navegador usando Microsoft Edge (Selenium).
+    Ações:
+    - 'navigate': Vai para uma URL (forneça 'url').
+    - 'click': Clica em um elemento (forneça 'selector' e opcionalmente 'by').
+    - 'type': Digita texto em um elemento (forneça 'selector', 'text'). Ex: text='{ENTER}' para pressionar Enter.
+    - 'scroll': Rola a página. Ex: script='window.scrollBy(0, 500)' ou vazio para rolar 1 tela.
+    - 'get_text': Pega o texto de um elemento (forneça 'selector') ou da página.
+    - 'get_html': Pega o HTML de um elemento (forneça 'selector') ou da página.
+    - 'execute_script': Executa JS (forneça 'script').
+    - 'close': Fecha o navegador.
     
-    O modelo deve gerar o HTML/CSS do conteúdo do slide (slide_content) com total liberdade criativa.
-    Use slide_bg para definir cor ou imagem de fundo (ex: 'background: #333;' ou 'background-image: url(...)').
-    
-    Args:
-    - action: 'create' (novo arquivo), 'add' (novo slide), 'update' (edita slide), 'delete' (remove), 'list' (lista).
-    - filepath: Caminho do arquivo .html.
-    - slide_content: Conteúdo HTML dentro do slide <div>. Use tags <script> para gráficos se necessário.
-    - slide_index: Índice do slide (começa em 1). Se -1 em add, adiciona ao fim.
-    - slide_bg: CSS para o atributo style do container do slide (opcional).
+    'by' pode ser: 'css' (padrão), 'id', 'name', 'xpath', 'link_text', 'class_name', 'tag_name'.
     """
-    path = get_safe_path(filepath)
+    try:
+        from selenium import webdriver
+        from selenium.webdriver.edge.service import Service as EdgeService
+        from selenium.webdriver.edge.options import Options as EdgeOptions
+        from selenium.webdriver.common.by import By
+        from selenium.webdriver.support.ui import WebDriverWait
+        from selenium.webdriver.support import expected_conditions as EC
+        from selenium.webdriver.common.keys import Keys
+        from webdriver_manager.microsoft import EdgeChromiumDriverManager
+    except ImportError:
+        return "Erro: Módulos 'selenium' ou 'webdriver_manager' não estão instalados. Execute 'pip install selenium webdriver-manager'."
+
+    global _browser_driver
+    if action == "close":
+        if _browser_driver:
+            try:
+                _browser_driver.quit()
+            except:
+                pass
+            _browser_driver = None
+            return "Navegador fechado."
+        return "Navegador já estava fechado."
+
+    if _browser_driver is None:
+        try:
+            options = EdgeOptions()
+            # options.add_argument("--headless") # Descomente se não quiser abrir a janela do navegador
+            options.add_argument("--no-sandbox")
+            options.add_argument("--disable-dev-shm-usage")
+            service = EdgeService(EdgeChromiumDriverManager().install())
+            _browser_driver = webdriver.Edge(service=service, options=options)
+            _browser_driver.implicitly_wait(10)
+        except Exception as e:
+            return f"Erro ao inicializar o Microsoft Edge: {str(e)}"
+
+    driver = _browser_driver
     
-    # Proteção: Se tentar salvar em 'skills', redireciona para 'workspace'
-    if str(path).startswith(str(SKILLS_DIR)):
-        rel_path = path.relative_to(SKILLS_DIR)
-        path = WORKSPACE_DIR / rel_path
-    
-    html_template = """<!DOCTYPE html>
-<html lang="pt-br">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Apresentação</title>
-    <script src="https://polyfill.io/v3/polyfill.min.js?features=es6"></script>
-    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/mermaid/dist/mermaid.min.js"></script>
-    <script>
-        mermaid.initialize({startOnLoad:true, theme: 'dark'});
-        
-        document.addEventListener('DOMContentLoaded', () => {
-            const container = document.querySelector('.slide-container');
-            const slides = document.querySelectorAll('.slide');
-            const prevBtn = document.getElementById('prev-btn');
-            const nextBtn = document.getElementById('next-btn');
-            const pageIndicator = document.getElementById('page-indicator');
+    by_map = {
+        "css": By.CSS_SELECTOR,
+        "id": By.ID,
+        "name": By.NAME,
+        "xpath": By.XPATH,
+        "link_text": By.LINK_TEXT,
+        "class_name": By.CLASS_NAME,
+        "tag_name": By.TAG_NAME
+    }
+    locator_by = by_map.get(by.lower(), By.CSS_SELECTOR)
+
+    try:
+        if action == "navigate":
+            if not url: return "Erro: 'url' não fornecida."
+            if not url.startswith("http"): url = "http://" + url
+            driver.get(url)
+            return f"Navegou para {url}. Título: {driver.title}"
             
-            function updateActiveSlide() {
-                const h = window.innerHeight;
-                const currentScroll = container.scrollTop;
-                const index = Math.round(currentScroll / h);
+        elif action == "click":
+            if not selector: return "Erro: 'selector' não fornecido."
+            element = WebDriverWait(driver, 10).until(EC.element_to_be_clickable((locator_by, selector)))
+            element.click()
+            return f"Clicou em {selector}."
+            
+        elif action == "type":
+            if not selector: return "Erro: 'selector' não fornecido."
+            element = WebDriverWait(driver, 10).until(EC.presence_of_element_located((locator_by, selector)))
+            element.clear()
+            if text.upper() == "{ENTER}":
+                element.send_keys(Keys.ENTER)
+                return f"Pressionou ENTER no elemento {selector}."
+            else:
+                element.send_keys(text)
+                return f"Digitou texto no elemento {selector}."
                 
-                if (pageIndicator) {
-                    pageIndicator.innerText = `${index + 1} / ${slides.length}`;
-                }
-            }
-
-            if (slides.length > 0) {
-                container.focus();
-                updateActiveSlide();
+        elif action == "scroll":
+            if script:
+                driver.execute_script(script)
+                return f"Scroll executado: {script}"
+            else:
+                driver.execute_script("window.scrollBy(0, window.innerHeight);")
+                return "Rolou a página uma tela para baixo."
                 
-                // Scroll navigation
-                container.addEventListener('scroll', () => {
-                    requestAnimationFrame(updateActiveSlide);
-                });
-
-                const navigate = (direction) => {
-                    const h = window.innerHeight;
-                    const currentScroll = container.scrollTop;
-                    const index = Math.round(currentScroll / h);
-                    
-                    let newIndex = index + direction;
-                    if (newIndex < 0) newIndex = 0;
-                    if (newIndex >= slides.length) newIndex = slides.length - 1;
-                    
-                    slides[newIndex].scrollIntoView({ behavior: 'smooth' });
-                };
-
-                window.addEventListener('keydown', (e) => {
-                    if (['ArrowRight', 'ArrowDown', ' '].includes(e.key)) {
-                        e.preventDefault();
-                        navigate(1);
-                    } else if (['ArrowLeft', 'ArrowUp'].includes(e.key)) {
-                        e.preventDefault();
-                        navigate(-1);
-                    }
-                });
+        elif action == "get_text":
+            if selector:
+                element = WebDriverWait(driver, 10).until(EC.presence_of_element_located((locator_by, selector)))
+                return element.text
+            else:
+                return driver.find_element(By.TAG_NAME, "body").text
                 
-                if (prevBtn) prevBtn.addEventListener('click', () => navigate(-1));
-                if (nextBtn) nextBtn.addEventListener('click', () => navigate(1));
-            }
-        });
-    </script>
-    <style>
-        /* Reset e Base */
-        * { box-sizing: border-box; margin: 0; padding: 0; }
-        body { 
-            font-family: 'Inter', system-ui, -apple-system, sans-serif; 
-            background: #000; 
-            color: #fff; 
-            height: 100vh; 
-            width: 100vw;
-            overflow: hidden;
-        }
-        
-        /* Container com Scroll Snap */
-        .slide-container { 
-            height: 100vh; 
-            width: 100vw;
-            overflow-y: auto; 
-            scroll-snap-type: y mandatory; 
-            scroll-behavior: smooth;
-            /* Hide scrollbar */
-            scrollbar-width: none;
-            -ms-overflow-style: none;
-        }
-        .slide-container::-webkit-scrollbar { 
-            display: none; 
-        }
-        
-        /* Slide Individual */
-        .slide { 
-            width: 100vw; 
-            height: 100vh; 
-            scroll-snap-align: start;
-            position: relative; 
-            overflow: hidden;
-            display: flex; 
-            flex-direction: column; 
-            justify-content: center; 
-            align-items: center;
-            background: #111; 
-            padding: 2rem;
-        }
-        
-        /* Classes utilitárias para o conteúdo */
-        .content-wrapper { 
-            max-width: 1400px; 
-            width: 100%; 
-            margin: 0 auto; 
-            z-index: 10; 
-            display: flex; 
-            flex-direction: column; 
-            height: 100%; 
-            justify-content: center;
-            /* Permite rolagem interna se o conteúdo exceder a altura da tela (evita cortes) */
-            overflow-y: auto;
-            scrollbar-width: none;
-        }
-        .content-wrapper::-webkit-scrollbar { display: none; }
-        
-        /* Tipografia Responsiva */
-        h1 { font-size: clamp(2.5rem, 5vw, 4.5rem); line-height: 1.1; margin-bottom: 1.5rem; font-weight: 800; letter-spacing: -0.03em; }
-        h2 { font-size: clamp(2rem, 4vw, 3.5rem); line-height: 1.2; margin-bottom: 1.5rem; font-weight: 700; letter-spacing: -0.02em; }
-        h3 { font-size: clamp(1.5rem, 3vw, 2.5rem); margin-bottom: 1rem; font-weight: 600; }
-        p { font-size: clamp(1rem, 1.5vw, 1.6rem); line-height: 1.6; color: rgba(255,255,255,0.9); margin-bottom: 1.5rem; max-width: 70ch; }
-        ul, ol { margin-left: 2rem; margin-bottom: 1.5rem; }
-        li { font-size: clamp(1rem, 1.5vw, 1.5rem); line-height: 1.6; margin-bottom: 0.8rem; }
-        
-        /* Gráficos e Imagens Responsivos */
-        .chart-container {
-            position: relative;
-            width: 100%;
-            height: 50vh; /* Altura padrão para gráficos */
-            min-height: 300px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-        }
-        
-        img, canvas, svg, .mermaid {
-            max-width: 100%;
-            max-height: 100%;
-            object-fit: contain;
-        }
-        
-        .grid { display: grid; gap: 2rem; width: 100%; }
-        .cols-2 { grid-template-columns: 1fr 1fr; }
-        .cols-3 { grid-template-columns: 1fr 1fr 1fr; }
-        
-        /* Ajuste para grids em telas menores */
-        @media (max-width: 768px) {
-            .cols-2, .cols-3 { grid-template-columns: 1fr; }
-            .slide { padding: 1rem; }
-        }
-        
-        .card { background: rgba(255,255,255,0.08); padding: 2rem; border-radius: 1rem; border: 1px solid rgba(255,255,255,0.1); backdrop-filter: blur(10px); }
-        .tag { display: inline-block; padding: 0.5rem 1rem; background: rgba(59, 130, 246, 0.2); color: #60a5fa; border: 1px solid rgba(59, 130, 246, 0.4); border-radius: 99px; font-size: 1rem; font-weight: bold; margin-right: 0.5rem; text-transform: uppercase; letter-spacing: 0.05em; }
-        
-        /* Controls */
-        .controls {
-            position: fixed;
-            bottom: 2rem;
-            right: 2rem;
-            z-index: 1000;
-            display: flex;
-            align-items: center;
-            gap: 1rem;
-            background: rgba(0, 0, 0, 0.6);
-            padding: 0.5rem 1rem;
-            border-radius: 2rem;
-            backdrop-filter: blur(10px);
-            border: 1px solid rgba(255,255,255,0.1);
-            transition: opacity 0.3s ease;
-            opacity: 0.4;
-        }
-        .controls:hover { opacity: 1; }
-        
-        .control-btn {
-            background: none;
-            border: none;
-            color: white;
-            cursor: pointer;
-            padding: 0.5rem;
-            border-radius: 50%;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            transition: background 0.2s;
-        }
-        .control-btn:hover { background: rgba(255,255,255,0.2); }
-        .control-btn svg { width: 24px; height: 24px; fill: currentColor; }
-        
-        .page-indicator {
-            font-size: 0.9rem;
-            font-weight: 600;
-            color: rgba(255,255,255,0.8);
-            min-width: 40px;
-            text-align: center;
-        }
-
-        /* Impressão */
-        @media print { 
-            .slide-container { overflow: visible; height: auto; }
-            .slide { page-break-after: always; height: 100vh; } 
-            .controls { display: none; }
-        }
-    </style>
-</head>
-<body>
-    <div class="slide-container">
-<!-- SLIDES_START -->
-<!-- SLIDES_END -->
-    </div>
-    
-    <div class="controls">
-        <button class="control-btn" id="prev-btn" title="Anterior">
-            <svg viewBox="0 0 24 24"><path d="M15.41 7.41L14 6l-6 6 6 6 1.41-1.41L10.83 12z"/></svg>
-        </button>
-        <span class="page-indicator" id="page-indicator">1 / --</span>
-        <button class="control-btn" id="next-btn" title="Próximo">
-            <svg viewBox="0 0 24 24"><path d="M10 6L8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z"/></svg>
-        </button>
-    </div>
-</body>
-</html>"""
-
-    if action == "create":
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(html_template)
-        return f"Apresentação criada em {path.name}."
-
-    if not path.exists():
-        return "Erro: Arquivo não existe. Use action='create' primeiro."
-
-    with open(path, "r", encoding="utf-8") as f:
-        content = f.read()
-
-    # Extrai slides existentes usando regex não-guloso até o marcador
-    # O padrão procura por <div class="slide" ...> ... </div><!-- /SLIDE -->
-    slide_pattern = re.compile(r'(<div class="slide".*?>.*?</div><!-- /SLIDE -->)', re.DOTALL)
-    slides = slide_pattern.findall(content)
-
-    if action == "list":
-        return f"Encontrados {len(slides)} slides."
-
-    # Prepara novo conteúdo
-    # Garante que o style tenha background se fornecido
-    style_attr = f'style="{slide_bg}"' if slide_bg else 'style=""'
-    new_slide = f'<div class="slide" {style_attr}>\n{slide_content}\n</div><!-- /SLIDE -->'
-
-    if action == "add":
-        if slide_index < 1:
-            slides.append(new_slide)
+        elif action == "get_html":
+            if selector:
+                element = WebDriverWait(driver, 10).until(EC.presence_of_element_located((locator_by, selector)))
+                return element.get_attribute('outerHTML')
+            else:
+                return driver.page_source
+                
+        elif action == "execute_script":
+            if not script: return "Erro: 'script' não fornecido."
+            res = driver.execute_script(script)
+            return f"Script executado. Retorno: {res}"
+            
         else:
-            slides.insert(slide_index - 1, new_slide)
+            return f"Ação desconhecida: {action}"
             
-    elif action == "update":
-        if slide_index < 1 or slide_index > len(slides):
-            return f"Erro: Slide {slide_index} inválido (Total: {len(slides)})."
-        slides[slide_index - 1] = new_slide
-        
-    elif action == "delete":
-        if slide_index < 1 or slide_index > len(slides):
-            return f"Erro: Slide {slide_index} inválido."
-        slides.pop(slide_index - 1)
-    
-    # Reconstrói o arquivo preservando cabeçalho e rodapé
-    if "<!-- SLIDES_START -->" in content and "<!-- SLIDES_END -->" in content:
-        parts = content.split("<!-- SLIDES_START -->")
-        header = parts[0] + "<!-- SLIDES_START -->\n"
-        footer = "\n<!-- SLIDES_END -->" + content.split("<!-- SLIDES_END -->")[1]
-        
-        new_content = header + "\n".join(slides) + footer
-        
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(new_content)
-        return f"Sucesso: {action} realizado. Total de slides: {len(slides)}."
-    else:
-        return "Erro: Estrutura do arquivo corrompida (marcadores não encontrados)."
+    except Exception as e:
+        return f"Erro ao executar '{action}': {str(e)}"
 
 if __name__ == "__main__":
     mcp.run(transport="stdio")

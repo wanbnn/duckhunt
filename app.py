@@ -9,6 +9,8 @@ import configparser
 import sys
 from itertools import cycle
 from urllib.parse import urlparse, parse_qs
+import shutil
+import hashlib
 
 # Importações do Rich
 from rich.console import Console, Group
@@ -23,7 +25,20 @@ from rich.align import Align
 from rich.rule import Rule
 from rich.style import Style
 
-from llama_cpp import Llama
+try:
+    from llama_cpp import Llama
+    LLAMA_CPP_AVAILABLE = True
+except ImportError:
+    Llama = None
+    LLAMA_CPP_AVAILABLE = False
+
+try:
+    import anthropic
+    ANTHROPIC_AVAILABLE = True
+except ImportError:
+    anthropic = None
+    ANTHROPIC_AVAILABLE = False
+
 from openai import OpenAI, AzureOpenAI
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
@@ -150,6 +165,43 @@ def load_config(section, key):
         return config.get(section, key)
     return None
 
+def get_checkpoint_dir(workspace_dir):
+    user_dir = os.path.expanduser("~")
+    duckhunt_cache = os.path.join(user_dir, ".duckhunt", "cache")
+    ws_hash = hashlib.md5(workspace_dir.encode('utf-8')).hexdigest()[:8]
+    ws_name = os.path.basename(os.path.normpath(workspace_dir))
+    return os.path.join(duckhunt_cache, f"{ws_name}_{ws_hash}", "checkpoint")
+
+def create_checkpoint(workspace_dir):
+    ckpt_dir = get_checkpoint_dir(workspace_dir)
+    try:
+        if os.path.exists(ckpt_dir):
+            shutil.rmtree(ckpt_dir, ignore_errors=True)
+            
+        def ignore_func(d, files):
+            ignored = {'.git', 'node_modules', 'venv', 'env', '__pycache__', '.pytest_cache', '.next', '.nuxt', 'dist', 'build', '.duckhunt'}
+            return [f for f in files if f in ignored or os.path.join(d, f) == ckpt_dir]
+            
+        shutil.copytree(workspace_dir, ckpt_dir, ignore=ignore_func, dirs_exist_ok=True)
+        return True
+    except Exception as e:
+        console.print(f"[dim red]Erro ao criar checkpoint: {e}[/dim red]")
+        return False
+
+def rollback_checkpoint(workspace_dir):
+    ckpt_dir = get_checkpoint_dir(workspace_dir)
+    if not os.path.exists(ckpt_dir):
+        return False, "Nenhum checkpoint encontrado para este workspace."
+    try:
+        def ignore_func(d, files):
+            ignored = {'.git', 'node_modules', 'venv', 'env', '__pycache__', '.pytest_cache', '.next', '.nuxt', 'dist', 'build', '.duckhunt'}
+            return [f for f in files if f in ignored]
+        
+        shutil.copytree(ckpt_dir, workspace_dir, ignore=ignore_func, dirs_exist_ok=True)
+        return True, "Rollback concluído com sucesso."
+    except Exception as e:
+        return False, f"Erro no rollback: {e}"
+
 SYSTEM_PROMPT = """
 You are a **senior development assistant running directly in the user's terminal**.
 You have **tools (Tools / Function Calling)** to interact with the system.
@@ -218,6 +270,65 @@ class UnifiedLLM:
                 yield response_generator
             return
 
+        if self.model_type == "anthropic":
+            if not ANTHROPIC_AVAILABLE: return
+            sys_msg = ""
+            anthropic_messages = []
+            
+            tools_injection = ""
+            if tools:
+                tools_list = [t.get('function', {}) for t in tools]
+                tools_injection = f"\n\n### AVAILABLE TOOLS\nUse the <tool_call> format to invoke tools.\nTools Schema:\n{json.dumps(tools_list, indent=2)}"
+            
+            for m in messages:
+                role = m.get("role", "")
+                if role == "system":
+                    sys_msg += m.get("content", "") + "\n"
+                else:
+                    mapped_role = "assistant" if role == "assistant" else "user"
+                    content = m.get("content", "") or ""
+                    if role == "assistant" and m.get("tool_calls"):
+                        for tc in m["tool_calls"]:
+                            try:
+                                args = json.loads(tc['function']['arguments'])
+                            except:
+                                args = tc['function']['arguments']
+                            content += f"\n<tool_call>\n{json.dumps({'name': tc['function']['name'], 'arguments': args})}\n</tool_call>"
+                    if role == "tool":
+                        content = f"Tool '{m.get('name', 'unknown')}' Result:\n{m.get('content', '')}"
+                    if not content:
+                        content = "(empty)"
+                        
+                    if anthropic_messages and anthropic_messages[-1]["role"] == mapped_role:
+                        anthropic_messages[-1]["content"] += f"\n\n{content}"
+                    else:
+                        anthropic_messages.append({"role": mapped_role, "content": content})
+
+            sys_msg += tools_injection
+
+            try:
+                if stream:
+                    with self.client.messages.stream(
+                        max_tokens=max_tokens or 4096,
+                        system=sys_msg,
+                        messages=anthropic_messages,
+                        model=self.model_name
+                    ) as stream_ctx:
+                        for text in stream_ctx.text_stream:
+                            yield {"choices": [{"delta": {"content": text}, "finish_reason": None}]}
+                        yield {"choices": [{"delta": {}, "finish_reason": "stop"}]}
+                else:
+                    resp = self.client.messages.create(
+                        max_tokens=max_tokens or 4096,
+                        system=sys_msg,
+                        messages=anthropic_messages,
+                        model=self.model_name
+                    )
+                    yield {"choices": [{"delta": {"content": resp.content[0].text}, "finish_reason": "stop"}]}
+            except Exception as e:
+                console.print(f"[red]Erro API Anthropic: {e}[/red]")
+            return
+
         kwargs = {
             "messages": messages,
             "stream": stream,
@@ -227,7 +338,7 @@ class UnifiedLLM:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = tool_choice
 
-        if self.model_type == "openai":
+        if self.model_type in ("openai", "gemini"):
             if max_tokens: kwargs["max_tokens"] = max_tokens
             if temperature: kwargs["temperature"] = temperature
         
@@ -251,15 +362,19 @@ class UnifiedLLM:
         delta = choice.delta
         delta_dict = {}
         if delta.content is not None: delta_dict["content"] = delta.content
-        if delta.tool_calls:
+        if getattr(delta, "tool_calls", None):
             delta_dict["tool_calls"] = []
             for tc in delta.tool_calls:
-                tc_dict = {"index": tc.index}
-                if tc.id: tc_dict["id"] = tc.id
-                if tc.function:
-                    tc_dict["function"] = {}
-                    if tc.function.name: tc_dict["function"]["name"] = tc.function.name
-                    if tc.function.arguments: tc_dict["function"]["arguments"] = tc.function.arguments
+                if hasattr(tc, "model_dump"):
+                    tc_dict = tc.model_dump(exclude_unset=True)
+                else:
+                    tc_dict = {"index": getattr(tc, "index", None)}
+                    if getattr(tc, "id", None): tc_dict["id"] = tc.id
+                    if getattr(tc, "type", None): tc_dict["type"] = tc.type
+                    if getattr(tc, "function", None):
+                        tc_dict["function"] = {}
+                        if getattr(tc.function, "name", None): tc_dict["function"]["name"] = tc.function.name
+                        if getattr(tc.function, "arguments", None): tc_dict["function"]["arguments"] = tc.function.arguments
                 delta_dict["tool_calls"].append(tc_dict)
         return {"choices": [{"delta": delta_dict, "finish_reason": choice.finish_reason}]}
 
@@ -441,17 +556,46 @@ def stream_and_accumulate(llm, messages, tools):
             # Acumula chamadas de ferramentas nativas
             if "tool_calls" in delta and delta["tool_calls"]:
                 for tc_chunk in delta["tool_calls"]:
-                    index = tc_chunk["index"]
+                    index = tc_chunk.get("index")
+                    if index is None:
+                        tc_id = tc_chunk.get("id")
+                        if tc_id:
+                            found_idx = next((i for i, t in enumerate(message["tool_calls"]) if t.get("id") == tc_id), None)
+                            if found_idx is not None:
+                                index = found_idx
+                            else:
+                                index = len(message["tool_calls"])
+                        else:
+                            index = max(0, len(message["tool_calls"]) - 1)
+                            
                     while len(message["tool_calls"]) <= index:
                         message["tool_calls"].append({
                             "id": "", "type": "function", "function": {"name": "", "arguments": ""}
                         })
                     tc_acc = message["tool_calls"][index]
-                    if "id" in tc_chunk: tc_acc["id"] += (tc_chunk["id"] or "")
-                    if "function" in tc_chunk:
-                        func = tc_chunk["function"]
-                        if "name" in func: tc_acc["function"]["name"] += (func["name"] or "")
-                        if "arguments" in func: tc_acc["function"]["arguments"] += (func["arguments"] or "")
+                    
+                    for k, v in tc_chunk.items():
+                        if k == "index": continue
+                        if k == "function" and isinstance(v, dict):
+                            for fk, fv in v.items():
+                                if fv is not None:
+                                    if fk in ["name", "arguments"]:
+                                        tc_acc["function"][fk] = tc_acc["function"].get(fk, "") + str(fv)
+                                    else:
+                                        if isinstance(fv, str):
+                                            tc_acc["function"][fk] = tc_acc["function"].get(fk, "") + fv
+                                        else:
+                                            tc_acc["function"][fk] = fv
+                        elif v is not None:
+                            if k == "type":
+                                tc_acc[k] = v # Não concatena 'type' para evitar 'functionfunction' no Azure
+                            elif k == "id":
+                                tc_acc[k] = tc_acc.get(k, "") + str(v)
+                            else:
+                                if isinstance(v, str):
+                                    tc_acc[k] = tc_acc.get(k, "") + v
+                                else:
+                                    tc_acc[k] = v
                         
     # --- FALLBACK: PARSER MANUAL DE TOOL CALL ---
     if not message["tool_calls"] and "<tool_call>" in message["content"]:
@@ -556,56 +700,156 @@ def animated_startup():
                 time.sleep(0.06)
     console.print()
 
-async def gerenciar_modelos(current_llm):
-    os.makedirs(MODELS_DIR, exist_ok=True)
-    modelos = [f for f in os.listdir(MODELS_DIR) if f.lower().endswith(".gguf")]
+async def adicionar_nova_api():
+    console.print("\n[bold #A55EEA]➕ Adicionar Nova API[/bold #A55EEA]")
     
-    api_list = []
+    tipo = Prompt.ask(
+        "[yellow]Escolha o tipo de API[/yellow]", 
+        choices=["OpenAI", "Azure", "Anthropic", "Gemini"], 
+        default="OpenAI"
+    )
+    
+    novo_modelo = {}
+    
+    if tipo == "OpenAI":
+        modelo = Prompt.ask("[yellow]Nome do modelo (ex: gpt-4o)[/yellow]")
+        api_key = Prompt.ask("[yellow]API Key[/yellow]", password=True)
+        novo_modelo = {tipo: {"model": modelo, "api_key": api_key}}
+        
+    elif tipo == "Azure":
+        deployment = Prompt.ask("[yellow]Nome do Deployment (ex: gpt-4o)[/yellow]")
+        endpoint = Prompt.ask("[yellow]Endpoint com API Version (ex: https://seu-recurso.openai.azure.com/?api_version=2024-08-01-preview)[/yellow]")
+        api_key = Prompt.ask("[yellow]API Key[/yellow]", password=True)
+        novo_modelo = {tipo: {"deployment": deployment, "endpoint": endpoint, "api_key": api_key}}
+        
+    elif tipo == "Anthropic":
+        modelo = Prompt.ask("[yellow]Nome do modelo (ex: claude-3-5-sonnet-20241022)[/yellow]")
+        api_key = Prompt.ask("[yellow]API Key[/yellow]", password=True)
+        novo_modelo = {tipo: {"model": modelo, "api_key": api_key}}
+        
+    elif tipo == "Gemini":
+        modelo = Prompt.ask("[yellow]Nome do modelo (ex: gemini-2.0-flash)[/yellow]")
+        api_key = Prompt.ask("[yellow]API Key[/yellow]", password=True)
+        novo_modelo = {tipo: {"model": modelo, "api_key": api_key}}
+
     api_cfg_path = os.path.join(MODELS_DIR, "api_config.json")
+    data = []
     if os.path.exists(api_cfg_path):
         try:
             with open(api_cfg_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                if isinstance(data, list):
-                    for item in data:
-                        for k, v in item.items():
-                            api_list.append({"type": k, "config": v})
-                elif isinstance(data, dict):
-                    for k, v in data.items():
-                        api_list.append({"type": k, "config": v})
-        except Exception as e:
-            console.print(f"[red]Erro ao ler api_config.json: {e}[/red]")
-
-    opcoes = []
-    for api in api_list:
-        cfg = api["config"]
-        name = cfg.get("deployment") or cfg.get("model") or "Unknown"
-        opcoes.append({"label": f"[{api['type']}] {name}", "value": api})
+                content = json.load(f)
+                if isinstance(content, list):
+                    data = content
+                elif isinstance(content, dict):
+                    data = [content]
+        except Exception:
+            pass
+            
+    data.append(novo_modelo)
     
-    for m in modelos:
-        opcoes.append({"label": f"[Local] {m}", "value": m})
-    
-    if not opcoes:
-        console.print(f"\n[red]Nenhum modelo encontrado em '{MODELS_DIR}'.[/red]\n")
-        return current_llm
+    os.makedirs(MODELS_DIR, exist_ok=True)
+    with open(api_cfg_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=4)
+        
+    notify_success(f"API '{tipo}' adicionada com sucesso!")
 
-    table = Table(title="🤖 Modelos Disponíveis", title_style="bold #FF8E53", border_style="#FF8E53")
-    table.add_column("ID", justify="center", style="bold #45B7D1", no_wrap=True)
-    table.add_column("Modelo", style="white")
-
-    for i, opt in enumerate(opcoes, 1):
-        table.add_row(str(i), opt['label'])
-
-    console.print(table)
-    console.print("  [dim][[/dim][bold #FF6B6B]c[/bold #FF6B6B][dim]] Cancelar[/dim]")
-    
+async def gerenciar_modelos(current_llm):
     while True:
-        escolha = Prompt.ask("\n[yellow]Digite o número do modelo desejado[/yellow]").strip().lower()
+        os.makedirs(MODELS_DIR, exist_ok=True)
+        modelos = [f for f in os.listdir(MODELS_DIR) if f.lower().endswith(".gguf")]
+        
+        api_list = []
+        api_cfg_path = os.path.join(MODELS_DIR, "api_config.json")
+        if os.path.exists(api_cfg_path):
+            try:
+                with open(api_cfg_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if isinstance(data, list):
+                        for item in data:
+                            for k, v in item.items():
+                                api_list.append({"type": k, "config": v})
+                    elif isinstance(data, dict):
+                        for k, v in data.items():
+                            api_list.append({"type": k, "config": v})
+            except Exception as e:
+                console.print(f"[red]Erro ao ler api_config.json: {e}[/red]")
+
+        opcoes = []
+        for api in api_list:
+            cfg = api["config"]
+            name = cfg.get("deployment") or cfg.get("model") or "Unknown"
+            opcoes.append({"label": f"[{api['type']}] {name}", "value": api})
+        
+        for m in modelos:
+            if LLAMA_CPP_AVAILABLE:
+                opcoes.append({"label": f"[Local] {m}", "value": m})
+            else:
+                opcoes.append({"label": f"[Local - INDISPONÍVEL] {m} (llama-cpp não instalado)", "value": None})
+        
+        console.print()
+        table = Table(title="🤖 Modelos Disponíveis", title_style="bold #FF8E53", border_style="#FF8E53")
+        table.add_column("ID", justify="center", style="bold #45B7D1", no_wrap=True)
+        table.add_column("Modelo", style="white")
+
+        if not opcoes:
+            table.add_row("-", "Nenhum modelo configurado.")
+        else:
+            for i, opt in enumerate(opcoes, 1):
+                table.add_row(str(i), opt['label'])
+
+        console.print(table)
+        console.print("  [dim][[/dim][bold #FF6B6B]c[/bold #FF6B6B][dim]] Cancelar[/dim]   [dim][[/dim][bold #4ECB71]a[/bold #4ECB71][dim]] Adicionar API[/dim]   [dim][[/dim][bold #FFC857]e[/bold #FFC857][dim]] Editar API[/dim]   [dim][[/dim][bold #FF6B6B]r[/bold #FF6B6B][dim]] Remover API[/dim]")
+        
+        escolha = Prompt.ask("\n[yellow]Digite o número do modelo para usar ou a opção desejada (c/a/e/r)[/yellow]").strip().lower()
         if escolha == 'c': return current_llm
+        if escolha == 'a':
+            await adicionar_nova_api()
+            continue
+            
+        if escolha == 'r' or escolha == 'e':
+            if not api_list:
+                notify_error("Não há APIs configuradas para alterar.")
+                continue
+                
+            idx_str = Prompt.ask(f"[yellow]Qual ID do modelo deseja {'editar' if escolha == 'e' else 'remover'}?[/yellow]").strip()
+            if idx_str.isdigit():
+                idx = int(idx_str) - 1
+                if 0 <= idx < len(api_list):
+                    api_alvo = api_list[idx]
+                    if escolha == 'r':
+                        api_list.pop(idx)
+                        notify_success(f"API removida com sucesso!")
+                    else:
+                        tipo = api_alvo["type"]
+                        cfg = api_alvo["config"]
+                        console.print(f"\n[bold #A55EEA]✏️ Editando API {tipo}[/bold #A55EEA]")
+                        
+                        if tipo == "Azure":
+                            cfg["deployment"] = Prompt.ask("[yellow]Nome do Deployment[/yellow]", default=cfg.get("deployment", ""))
+                            cfg["endpoint"] = Prompt.ask("[yellow]Endpoint com API Version[/yellow]", default=cfg.get("endpoint", ""))
+                            cfg["api_key"] = Prompt.ask("[yellow]API Key[/yellow]", password=True, default=cfg.get("api_key", ""))
+                        else:
+                            cfg["model"] = Prompt.ask("[yellow]Nome do modelo[/yellow]", default=cfg.get("model", ""))
+                            cfg["api_key"] = Prompt.ask("[yellow]API Key[/yellow]", password=True, default=cfg.get("api_key", ""))
+                        
+                        api_list[idx]["config"] = cfg
+                        notify_success(f"API '{tipo}' editada com sucesso!")
+                    
+                    # Salva alterações de volta no api_config.json
+                    nova_lista = [{a["type"]: a["config"]} for a in api_list]
+                    with open(api_cfg_path, "w", encoding="utf-8") as f:
+                        json.dump(nova_lista, f, indent=4)
+                else:
+                    notify_error("ID inválido ou não é uma API configurável.")
+            continue
             
         if escolha.isdigit() and 0 <= int(escolha) - 1 < len(opcoes):
             selecionado = opcoes[int(escolha) - 1]["value"]
             
+            if selecionado is None:
+                notify_error("Este modelo local não pode ser carregado pois 'llama-cpp-python' não está instalado.")
+                continue
+
             if current_llm is not None: del current_llm
             
             if isinstance(selecionado, str):
@@ -654,6 +898,28 @@ async def gerenciar_modelos(current_llm):
                         save_config("Model", "type", "openai")
                         save_config("Model", "name", mdl)
                         return UnifiedLLM(client, "openai", mdl)
+                    elif tipo == "Gemini":
+                        client = OpenAI(
+                            api_key=cfg.get("api_key"),
+                            base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
+                        )
+                        mdl = cfg.get("model")
+                        console.print(f"[green]✓ Cliente Gemini ('{mdl}') configurado![/green]")
+                        notify_success(f"Gemini '{mdl}' configurado!")
+                        save_config("Model", "type", "gemini")
+                        save_config("Model", "name", mdl)
+                        return UnifiedLLM(client, "gemini", mdl)
+                    elif tipo == "Anthropic":
+                        if not ANTHROPIC_AVAILABLE:
+                            notify_error("A biblioteca 'anthropic' não está instalada. Execute 'pip install anthropic'.")
+                            continue
+                        client = anthropic.Anthropic(api_key=cfg.get("api_key"))
+                        mdl = cfg.get("model")
+                        console.print(f"[green]✓ Cliente Anthropic ('{mdl}') configurado![/green]")
+                        notify_success(f"Anthropic '{mdl}' configurado!")
+                        save_config("Model", "type", "anthropic")
+                        save_config("Model", "name", mdl)
+                        return UnifiedLLM(client, "anthropic", mdl)
                 except Exception as e:
                     notify_error(f"Erro ao configurar API: {e}")
                     return None
@@ -710,6 +976,9 @@ async def autoload_model():
             if m_type == "local":
                 path = load_config("Model", "path")
                 if path and os.path.exists(path):
+                    if not LLAMA_CPP_AVAILABLE:
+                        notify_error(f"Modelo Local '{m_name}' não pode ser restaurado (llama-cpp não instalado).")
+                        return None
                     llama = await asyncio.to_thread(Llama, model_path=path, n_ctx=8192, n_gpu_layers=0, verbose=False)
                     notify_success(f"Modelo Local '{m_name}' restaurado.")
                     return UnifiedLLM(llama, "local", m_name)
@@ -738,8 +1007,315 @@ async def autoload_model():
                                             client = OpenAI(api_key=v.get("api_key"))
                                             notify_success(f"OpenAI '{m_name}' restaurado.")
                                             return UnifiedLLM(client, "openai", m_name)
+                                        elif m_type == "gemini":
+                                            client = OpenAI(
+                                                api_key=v.get("api_key"),
+                                                base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
+                                            )
+                                            notify_success(f"Gemini '{m_name}' restaurado.")
+                                            return UnifiedLLM(client, "gemini", m_name)
+                                        elif m_type == "anthropic":
+                                            if not ANTHROPIC_AVAILABLE:
+                                                notify_error(f"Anthropic '{m_name}' não pode ser restaurado (biblioteca anthropic não instalada).")
+                                                return None
+                                            client = anthropic.Anthropic(api_key=v.get("api_key"))
+                                            notify_success(f"Anthropic '{m_name}' restaurado.")
+                                            return UnifiedLLM(client, "anthropic", m_name)
         except Exception: pass
     return None
+
+def gerenciar_mcp():
+    if not os.path.exists(MCP_CONFIG_PATH):
+        notify_error(f"Arquivo de configuração {MCP_CONFIG_PATH} não encontrado.")
+        return
+
+    while True:
+        with open(MCP_CONFIG_PATH, "r", encoding="utf-8") as f:
+            mcp_config = json.load(f)
+
+        console.print("\n[bold #A55EEA]🔌 Gerenciar Servidores MCP[/bold #A55EEA]")
+        
+        servers = list(mcp_config.get("mcpServers", {}).items())
+        
+        table = Table(title="Servidores Configurados", title_style="bold #FFC857", border_style="#FFC857")
+        table.add_column("ID", justify="center", style="bold #45B7D1", no_wrap=True)
+        table.add_column("Nome", style="white")
+        table.add_column("Status", style="bold")
+        table.add_column("Tipo", style="white")
+        
+        if not servers:
+            table.add_row("-", "Nenhum servidor configurado", "-", "-")
+        else:
+            for i, (name, cfg) in enumerate(servers, 1):
+                status = "[red]Desativado[/red]" if cfg.get("disabled") else "[green]Ativado[/green]"
+                typ = cfg.get("type", "stdio" if "command" in cfg else "unknown")
+                table.add_row(str(i), name, status, typ)
+                
+        console.print(table)
+        console.print("  [dim][[/dim][bold #FF6B6B]c[/bold #FF6B6B][dim]] Cancelar[/dim]   [dim][[/dim][bold #4ECB71]a[/bold #4ECB71][dim]] Adicionar[/dim]   [dim][[/dim][bold #FFC857]t[/bold #FFC857][dim]] Alternar Status[/dim]   [dim][[/dim][bold #FF6B6B]r[/bold #FF6B6B][dim]] Remover[/dim]")
+        
+        escolha = Prompt.ask("\n[yellow]Digite a opção desejada (c/a/t/r)[/yellow]").strip().lower()
+        if escolha == 'c': break
+        
+        if escolha == 'a':
+            name = Prompt.ask("[yellow]Nome do novo servidor[/yellow]")
+            typ = Prompt.ask("[yellow]Tipo (stdio/sse)[/yellow]", choices=["stdio", "sse"], default="stdio")
+            
+            new_cfg = {"type": typ}
+            if typ == "stdio":
+                new_cfg["command"] = Prompt.ask("[yellow]Comando (ex: npx, python)[/yellow]")
+                args_str = Prompt.ask("[yellow]Argumentos (separados por espaço)[/yellow]")
+                new_cfg["args"] = args_str.split() if args_str else []
+            else:
+                new_cfg["url"] = Prompt.ask("[yellow]URL do servidor SSE[/yellow]")
+                
+            mcp_config.setdefault("mcpServers", {})[name] = new_cfg
+            with open(MCP_CONFIG_PATH, "w", encoding="utf-8") as f:
+                json.dump(mcp_config, f, ensure_ascii=False, indent=2)
+            notify_success(f"Servidor '{name}' adicionado! (As alterações terão efeito no próximo reinício)")
+            
+        elif escolha in ('t', 'r'):
+            if not servers:
+                notify_error("Nenhum servidor para alterar.")
+                continue
+            idx_str = Prompt.ask("[yellow]Qual ID do servidor?[/yellow]").strip()
+            if idx_str.isdigit():
+                idx = int(idx_str) - 1
+                if 0 <= idx < len(servers):
+                    srv_name = servers[idx][0]
+                    if escolha == 't':
+                        current_status = mcp_config["mcpServers"][srv_name].get("disabled", False)
+                        mcp_config["mcpServers"][srv_name]["disabled"] = not current_status
+                        with open(MCP_CONFIG_PATH, "w", encoding="utf-8") as f:
+                            json.dump(mcp_config, f, ensure_ascii=False, indent=2)
+                        notify_success(f"Status do '{srv_name}' alterado! (As alterações terão efeito no próximo reinício)")
+                    elif escolha == 'r':
+                        del mcp_config["mcpServers"][srv_name]
+                        with open(MCP_CONFIG_PATH, "w", encoding="utf-8") as f:
+                            json.dump(mcp_config, f, ensure_ascii=False, indent=2)
+                        notify_success(f"Servidor '{srv_name}' removido! (As alterações terão efeito no próximo reinício)")
+                else:
+                    notify_error("ID inválido.")
+
+async def run_multi_agents(llm, tools, workspace_dir, mcp_sessions, mcp_tools, agent_prompt_text, skills_prompts):
+    console.print("\n[bold #A55EEA]🤖 Modo Multi-Agent Iniciado[/bold #A55EEA]")
+    
+    agentes_nomes = []
+    agentes_prompts = []
+    
+    agentes_files = []
+    if os.path.exists(AGENTS_DIR):
+        agentes_files = [f for f in os.listdir(AGENTS_DIR) if f.lower().endswith(".md")]
+        
+    if agentes_files:
+        table = Table(title="🎯 Agentes Disponíveis na Pasta", title_style="bold #A55EEA", border_style="#A55EEA")
+        table.add_column("ID", justify="center", style="bold #45B7D1", no_wrap=True)
+        table.add_column("Nome do Agente", style="white")
+        for i, anome in enumerate(agentes_files, 1):
+            table.add_row(str(i), anome.replace(".md", ""))
+        console.print(table)
+        console.print("[dim]Você pode digitar IDs (ex: 1,3) ou customizar os nomes/funções (ex: Product Owner)[/dim]")
+        
+    agentes_input = Prompt.ask("\n[yellow]Digite os IDs ou nomes dos agentes separados por vírgula[/yellow]")
+    if not agentes_input.strip(): return
+    
+    for item in agentes_input.split(","):
+        item = item.strip()
+        if not item: continue
+        
+        if item.isdigit() and 0 <= int(item) - 1 < len(agentes_files):
+            fname = agentes_files[int(item) - 1]
+            nome = fname.replace(".md", "")
+            agentes_nomes.append(nome)
+            try:
+                with open(os.path.join(AGENTS_DIR, fname), 'r', encoding='utf-8') as f:
+                    agentes_prompts.append(f.read())
+            except Exception:
+                agentes_prompts.append(agent_prompt_text)
+        else:
+            agentes_nomes.append(item)
+            agentes_prompts.append(agent_prompt_text)
+            
+    n_agents = len(agentes_nomes)
+    if n_agents == 0: return
+    
+    task = Prompt.ask("[bold #FFC857]Qual é a tarefa a ser resolvida pelos agentes?[/bold #FFC857]")
+    if not task.strip(): return
+    
+    duckroom_proc = None
+    if load_config("General", "duckroom") == "on":
+        import subprocess
+        duck_script = os.path.join(BASE_DIR, "duck_room.py")
+        try:
+            duckroom_proc = subprocess.Popen(
+                [sys.executable, duck_script, "--agent-mode", "--ducks", str(n_agents)], 
+                stdin=subprocess.PIPE, 
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                text=True, 
+                encoding="utf-8"
+            )
+        except Exception as e:
+            console.print(f"[red]Erro ao iniciar Duck Room: {e}[/red]")
+        
+    from rich.layout import Layout
+    layout = Layout()
+    
+    layout.split_row(*[Layout(name=f"agent_{i}") for i in range(n_agents)])
+    
+    agent_texts = {i: "" for i in range(n_agents)}
+    shared_history = [
+        {"role": "user", "content": f"TAREFA PRINCIPAL: {task}\n\nVocês são a seguinte equipe: {', '.join(agentes_nomes)}.\nTrabalhem juntos, discutindo e resolvendo a demanda do usuário. Usem as ferramentas MCP à disposição se precisarem interagir com arquivos.\n\nREGRAS DE COLABORAÇÃO:\n1. NÃO tomem decisões unilaterais fora da sua função. Cada agente tem um papel específico (ex: Product Owner cria/organiza demandas, Dev constrói/executa, QA analisa falhas, etc).\n2. Se você precisa que outro agente faça uma parte do trabalho, FAÇA A PASSAGEM DA TAREFA DE FORMA CLARA, citando o agente que deve assumir e passando o contexto necessário.\n\nIMPORTANTE: Quando a equipe concluir 100% da Tarefa Principal e todos concordarem que nada mais precisa ser feito (o código foi concluído, as validações e entregas feitas), qualquer agente pode simplesmente incluir a palavra-chave exata [TASK_COMPLETED] na sua resposta para encerrar este ciclo de colaboração."}
+    ]
+    
+    def get_layout():
+        for i, name in enumerate(agentes_nomes):
+            txt = agent_texts[i]
+            # Limitar tamanho de exibição para não quebrar UI vertical com histórico longo
+            lines = txt.split("\n")
+            if len(lines) > 60:
+                txt = "...\n" + "\n".join(lines[-60:])
+            try:
+                panel_text = Text.from_markup(txt)
+            except Exception:
+                panel_text = Text(txt)
+                
+            panel_text.no_wrap = False
+            panel_text.overflow = "fold"
+            
+            panel = Panel(
+                panel_text,
+                title=f"[bold #45B7D1]🎭 {name}[/bold #45B7D1]",
+                border_style="#45B7D1",
+                expand=True
+            )
+            layout[f"agent_{i}"].update(panel)
+        return layout
+
+    with Live(get_layout(), console=console, refresh_per_second=15) as live:
+        round_idx = 0
+        while True:
+            # Cria processos de consumos para cada agente concorrente para rodarem simultaneamente
+            streams = []
+            for i, name in enumerate(agentes_nomes):
+                custom_base_sys = compor_prompt_sistema(agentes_prompts[i], skills_prompts)
+                sys_prompt = f"{custom_base_sys}\n\n[Você é o '{name}' nesta rodada da equipe. Lembre-se, use [TASK_COMPLETED] se a missão de todos já estiver concluída e finalizada no projeto.]"
+                msgs = [{"role": "system", "content": sys_prompt}]
+                msgs.extend(shared_history)
+                streams.append(llm.create_chat_completion(messages=msgs, tools=tools, tool_choice="auto", max_tokens=2048, stream=True))
+
+            async def consume_stream(i, generator):
+                message = {"role": "assistant", "content": "", "tool_calls": []}
+                def get_next():
+                    try: return next(generator)
+                    except StopIteration: return None
+                    except Exception as e: return {"error": str(e)}
+
+                while True:
+                    chunk = await asyncio.to_thread(get_next)
+                    if chunk is None or "error" in chunk: break
+                    
+                    delta = chunk.get("choices", [{}])[0].get("delta", {})
+                    if "content" in delta and delta["content"]:
+                        message["content"] += delta["content"]
+                        from rich.markup import escape
+                        agent_texts[i] += escape(delta["content"])
+                        
+                        if duckroom_proc and duckroom_proc.poll() is None:
+                            try:
+                                msg_json = json.dumps({"duck": i, "message": message["content"]})
+                                duckroom_proc.stdin.write(msg_json + "\n")
+                                duckroom_proc.stdin.flush()
+                            except Exception: pass
+                            
+                        live.update(get_layout())
+                        
+                    if "tool_calls" in delta and delta["tool_calls"]:
+                        for tc_chunk in delta["tool_calls"]:
+                            idx = tc_chunk.get("index", 0)
+                            while len(message["tool_calls"]) <= idx:
+                                message["tool_calls"].append({"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
+                            
+                            tc_acc = message["tool_calls"][idx]
+                            for k, v in tc_chunk.items():
+                                if k == "index": continue
+                                if k == "function" and isinstance(v, dict):
+                                    for fk, fv in v.items():
+                                        if fv is not None:
+                                            tc_acc["function"][fk] = tc_acc["function"].get(fk, "") + str(fv)
+                                elif v is not None:
+                                    if k == "type": tc_acc[k] = v
+                                    elif k == "id": tc_acc[k] = tc_acc.get(k, "") + str(v)
+                                    else: tc_acc[k] = tc_acc.get(k, "") + str(v)
+                                    
+                if message.get("tool_calls"):
+                    for idx_tc, tc in enumerate(message["tool_calls"]):
+                        if not tc.get("id"):
+                            tc["id"] = f"call_m{i}_{idx_tc}"
+                            
+                # Limpa tool_calls se for array vazio
+                if "tool_calls" in message and not message["tool_calls"]:
+                    del message["tool_calls"]
+                    
+                return message
+
+            tasks = [asyncio.create_task(consume_stream(i, streams[i])) for i in range(n_agents)]
+            results = await asyncio.gather(*tasks)
+
+            # Sincroniza e Processa ferramentas (execução sequencial no final do round de cada agente)
+            for i, name in enumerate(agentes_nomes):
+                res = results[i]
+                agent_texts[i] += f"\n\n[dim]--- Fim da fala do {name} na rodada {round_idx+1} ---[/dim]\n"
+                
+                ast_msg = {"role": "assistant"}
+                
+                content_text = res.get("content", "").strip()
+                if content_text:
+                    ast_msg["content"] = f"[{name} comentou]:\n{content_text}"
+                else:
+                    ast_msg["content"] = f"[{name} chamou ferramentas]"
+                    
+                if res.get("tool_calls"):
+                    ast_msg["tool_calls"] = res["tool_calls"]
+                    
+                if ast_msg.get("content") or ast_msg.get("tool_calls"):
+                    shared_history.append(ast_msg)
+                
+                if res.get("tool_calls"):
+                    for tc in res["tool_calls"]:
+                        tname = tc.get("function", {}).get("name")
+                        try:
+                            targs = json.loads(tc.get("function", {}).get("arguments", "{}"))
+                            agent_texts[i] += f"\n[bold #FF8E53]⚙ Executando {tname}...[/bold #FF8E53]"
+                            live.update(get_layout())
+                            
+                            target_srv = mcp_tools.get(tname)
+                            if target_srv and target_srv in mcp_sessions:
+                                sess = mcp_sessions[target_srv]
+                                tool_res = await sess.call_tool(tname, targs)
+                                t_out = "\n".join([c.text for c in tool_res.content if c.type == "text"])
+                                agent_texts[i] += f"\n[green]✓ {tname} concluído[/green]\n"
+                                shared_history.append({"role": "tool", "name": tname, "content": f"Resultado de {tname}:\n{t_out}", "tool_call_id": tc.get("id")})
+                            else:
+                                agent_texts[i] += f"\n[red]✗ {tname}: MCP inativo[/red]\n"
+                                shared_history.append({"role": "tool", "name": tname, "content": f"Erro: MCP inativo", "tool_call_id": tc.get("id")})
+                        except Exception as e:
+                            agent_texts[i] += f"\n[red]✗ Erro no {tname}: {e}[/red]\n"
+                            shared_history.append({"role": "tool", "name": tname, "content": f"Erro de processamento: {e}", "tool_call_id": tc.get("id")})
+                            
+            live.update(get_layout())
+            
+            # Verifica se algum dos agentes declarou fim da tarefa
+            task_completed = any("[TASK_COMPLETED]" in res.get("content", "") for res in results)
+            if task_completed:
+                break
+                
+            round_idx += 1
+            
+    if duckroom_proc and duckroom_proc.poll() is None:
+        duckroom_proc.terminate()
+        
+    console.print("\n[bold green]✅ Modo Multi-Agent Concluído e Tarefa Finalizada de forma autônoma pelos Agentes![/bold green]")
 
 async def run_chat_loop():
     # Animação de startup
@@ -775,237 +1351,323 @@ async def run_chat_loop():
     with open(MCP_CONFIG_PATH, "r", encoding="utf-8") as f:
         mcp_config = json.load(f)
 
-    ducktools_cfg = mcp_config.get("mcpServers", {}).get("ducktools")
-    if not ducktools_cfg:
-        notify_error("Servidor 'ducktools' não encontrado em config.json")
-        return
+    # Config ducktools workspace se ele existir e for stdio
+    if "ducktools" in mcp_config.get("mcpServers", {}):
+        mcp_config["mcpServers"]["ducktools"].setdefault("env", {})["WORKSPACE_DIR"] = workspace_dir
+        with open(MCP_CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(mcp_config, f, ensure_ascii=False, indent=2)
 
-    ducktools_cfg.setdefault("env", {})["WORKSPACE_DIR"] = workspace_dir
-    with open(MCP_CONFIG_PATH, "w", encoding="utf-8") as f:
-        json.dump(mcp_config, f, ensure_ascii=False, indent=2)
+    import contextlib
 
-    cmd = ducktools_cfg.get("command", "python")
-    if cmd == "python" or cmd.endswith("python.exe") or cmd.endswith("python3"):
-        cmd = sys.executable
+    # Inicia a conexão com os servidores MCP
+    async with contextlib.AsyncExitStack() as stack:
+        mcp_sessions = {}
+        mcp_tools = {}
+        llama_tools = []
 
-    server_params = StdioServerParameters(
-        command=cmd,
-        args=ducktools_cfg.get("args", []),
-        env={**os.environ, **ducktools_cfg["env"]}
-    )
+        animated_separator("Conexão MCP", "#45B7D1")
+        
+        # 1. Animação de conexão com pato
+        with Live(console=console, refresh_per_second=12) as live:
+            for i in range(12):
+                frame = DUCK_FRAMES[i % len(DUCK_FRAMES)]
+                msg = Text()
+                msg.append(f"  {frame} ", style="yellow")
+                msg.append("Conectando aos Servidores MCP...", style="bold #45B7D1")
+                live.update(msg)
+                await asyncio.sleep(0.08)
+        
+        with Status("[bold #45B7D1]🔌 Inicializando protocolo MCP...[/bold #45B7D1]", console=console, spinner="dots12"):
+            for srv_name, srv_cfg in mcp_config.get("mcpServers", {}).items():
+                if srv_cfg.get("disabled", False):
+                    continue
 
-    # Inicia a conexão com o servidor
-    async with stdio_client(server_params) as (read, write):
-        async with ClientSession(read, write) as session:
-            
-            animated_separator("Conexão MCP", "#45B7D1")
-            
-            # 1. Animação de conexão com pato
-            with Live(console=console, refresh_per_second=12) as live:
-                for i in range(12):
-                    frame = DUCK_FRAMES[i % len(DUCK_FRAMES)]
-                    msg = Text()
-                    msg.append(f"  {frame} ", style="yellow")
-                    msg.append("Conectando ao Servidor MCP...", style="bold #45B7D1")
-                    live.update(msg)
-                    await asyncio.sleep(0.08)
-            
-            with Status("[bold #45B7D1]🔌 Inicializando protocolo MCP...[/bold #45B7D1]", console=console, spinner="dots12"):
-                await session.initialize()
-                mcp_tools_response = await session.list_tools()
-                
-                llama_tools = [{
-                    "type": "function",
-                    "function": {"name": t.name, "description": t.description, "parameters": t.inputSchema}
-                } for t in mcp_tools_response.tools]
+                typ = srv_cfg.get("type", "stdio")
+                if "command" in srv_cfg and "type" not in srv_cfg: typ = "stdio"
 
-            n_tools = len(llama_tools)
-            notify_success(f"MCP conectado! {n_tools} ferramentas disponíveis.")
-
-            # 2. CONFIGURAÇÃO DE PROMPTS
-            animated_separator("Carregando Configurações", "#A55EEA")
-            saved_agent = autoload_agent()
-            agent_prompt_text = saved_agent if saved_agent else SYSTEM_PROMPT
-            
-            skills_prompts = autoload_skills()
-            
-            messages = [{"role": "system", "content": compor_prompt_sistema(agent_prompt_text, skills_prompts)}]
-            llm = None 
-
-            # 3. CARREGAMENTO DO MODELO
-            llm = await autoload_model()
-            if not llm:
-                animated_separator("Seleção de Modelo", "#FF8E53")
-                llm = await gerenciar_modelos(llm)
-
-            # Menu de comandos estilizado
-            console.print()
-            menu_table = Table(box=None, show_header=False, padding=(0, 2))
-            menu_table.add_column(style="bold #FFC857")
-            menu_table.add_column(style="white")
-            menu_table.add_row("🤖 /models", "Gerenciar modelos de IA")
-            menu_table.add_row("🎯 /agents", "Carregar agente personalizado")
-            menu_table.add_row("⚡ /skills", "Carregar skills (ferramentas)")
-            menu_table.add_row("🧹 /skills clear", "Limpar todas as skills")
-            menu_table.add_row("🔄 /new", "Reiniciar conversa")
-            menu_table.add_row("❓ /help", "Exibir esta lista de comandos")
-            menu_table.add_row("👋 /sair", "Encerrar aplicação")
-
-            console.print(Panel(
-                menu_table,
-                title="[bold #4ECB71]⌨  Comandos Disponíveis[/bold #4ECB71]",
-                border_style="#4ECB71",
-                expand=False,
-                padding=(1, 2),
-            ))
-            
-            # Barra de status da sessão
-            model_name = llm.model_name if llm else None
-            agent_file = load_config("Agent", "filename")
-            status_bar(model_name, agent_file, skills_prompts if skills_prompts else None)
-
-            # 4. LOOP INFINITO DO CHAT
-            while True:
                 try:
-                    console.print()
-                    animated_separator(style="dim")
+                    if typ == "stdio":
+                        cmd = srv_cfg.get("command", "python")
+                        if cmd in ("python", "python.exe", "python3"): cmd = sys.executable
+                        env = {**os.environ, **srv_cfg.get("env", {})}
+                        params = StdioServerParameters(command=cmd, args=srv_cfg.get("args", []), env=env)
+                        read, write = await stack.enter_async_context(stdio_client(params))
+                    elif typ in ("http", "sse"):
+                        try:
+                            from mcp.client.sse import sse_client
+                            read, write = await stack.enter_async_context(sse_client(srv_cfg.get("url")))
+                        except ImportError:
+                            notify_error(f"Não foi possível importar sse_client para {srv_name}.")
+                            continue
+                    else:
+                        notify_error(f"Tipo MCP desconhecido: {typ}")
+                        continue
+
+                    session = await stack.enter_async_context(ClientSession(read, write))
+                    await session.initialize()
+                    mcp_sessions[srv_name] = session
                     
-                    # Prompt estilizado com timestamp
-                    from datetime import datetime
-                    ts = datetime.now().strftime("%H:%M")
-                    user_input = Prompt.ask(f"[dim]{ts}[/dim] [bold #45B7D1]Você[/bold #45B7D1] [bold #4ECB71]›[/bold #4ECB71]")
-                    cmd = user_input.strip().lower()
-                    
-                    if cmd in ['/sair', '/exit', '/quit', 'sair', 'exit', 'quit']:
-                        # Animação de despedida
-                        console.print()
-                        farewell = gradient_text("🦆 Até a próxima caçada! Encerrando DuckHunt... 🦆")
-                        console.print(Align.center(farewell))
-                        console.print()
-                        break
-                    if cmd in ['/models', '/model', '/modelo']:
-                        animated_separator("Seleção de Modelo", "#FF8E53")
-                        llm = await gerenciar_modelos(llm)
-                        model_name = llm.model_name if llm else None
-                        status_bar(model_name, load_config("Agent", "filename"), skills_prompts if skills_prompts else None)
-                        continue
-                    if cmd in ['/agents', '/agent', '/agente']:
-                        animated_separator("Seleção de Agente", "#A55EEA")
-                        novo_prompt = gerenciar_agentes(agent_prompt_text)
-                        if novo_prompt != agent_prompt_text:
-                            agent_prompt_text = novo_prompt
-                            messages = [{"role": "system", "content": compor_prompt_sistema(agent_prompt_text, skills_prompts)}]
-                            notify_info("Contexto reiniciado com o novo agente.")
-                        continue
-                    if cmd in ['/skills clear', '/skill clear', '/skillsclear', '/skillclear']:
-                        skills_prompts = []
-                        messages = [{"role": "system", "content": compor_prompt_sistema(agent_prompt_text, skills_prompts)}]
-                        notify_info("Skills removidas. Contexto reiniciado.")
-                        continue
-                    if cmd in ['/skills', '/skill', '/skill']:
-                        animated_separator("Skills", "#FFC857")
-                        novas = gerenciar_skills()
-                        if novas:
-                            existentes = {s.get("name") for s in skills_prompts}
-                            for sk in novas:
-                                if sk.get("name") not in existentes:
-                                    skills_prompts.append(sk)
-                            messages = [{"role": "system", "content": compor_prompt_sistema(agent_prompt_text, skills_prompts)}]
-                            notify_success("Contexto atualizado com novas skills.")
-                        continue
-                    
-                    if cmd == '/new':
-                        messages = [{"role": "system", "content": compor_prompt_sistema(agent_prompt_text, skills_prompts)}]
-                        notify_info("🔄 Chat reiniciado. Nova conversa iniciada.")
-                        continue
-                    
-                    if cmd == '/help':
-                        console.print(Panel(
-                            menu_table,
-                            title="[bold #4ECB71]⌨  Comandos Disponíveis[/bold #4ECB71]",
-                            border_style="#4ECB71",
-                            expand=False,
-                            padding=(1, 2),
-                        ))
-                        continue
-
-                    if not user_input.strip(): continue
-                    if llm is None:
-                        notify_error("Nenhum modelo carregado! Use /models.")
-                        continue
-
-                    messages.append({"role": "user", "content": user_input})
-
-                    # LOOP DE RACIOCÍNIO E FERRAMENTAS
-                    while True:
-                        # Executa a geração em uma thread para não bloquear o Asyncio
-                        message = await asyncio.to_thread(stream_and_accumulate, llm, messages, llama_tools)
-                        messages.append(message) 
-                        
-                        if "tool_calls" not in message:
-                            break
-                        
-                        # Processa as ferramentas com visual aprimorado
-                        for tool_call in message["tool_calls"]:
-                            tool_name = tool_call["function"]["name"]
-                            tool_args = json.loads(tool_call["function"]["arguments"])
-                            
-                            # Painel de execução da ferramenta
-                            tool_display = Text()
-                            tool_display.append("⚙ ", style="bold #FF8E53")
-                            tool_display.append(tool_name, style="bold #FFC857")
-                            tool_display.append(f"\n{json.dumps(tool_args, indent=2, ensure_ascii=False)[:200]}", style="dim")
-                            console.print(Panel(
-                                tool_display,
-                                title="[bold #FF8E53]Executando Ferramenta[/bold #FF8E53]",
-                                border_style="#FF8E53",
-                                expand=False,
-                                padding=(0, 1),
-                            ))
-                            
-                            # Animação de pato durante execução da ferramenta
-                            with Live(console=console, refresh_per_second=10) as live:
-                                task_done = False
-                                frame_idx = 0
-                                
-                                async def run_tool():
-                                    nonlocal task_done
-                                    try:
-                                        result = await session.call_tool(tool_name, tool_args)
-                                        return "\n".join([c.text for c in result.content if c.type == "text"])
-                                    except Exception as e:
-                                        return f"Erro: {str(e)}"
-                                    finally:
-                                        task_done = True
-                                
-                                tool_task = asyncio.create_task(run_tool())
-                                
-                                while not task_done:
-                                    frame = DUCK_FRAMES[frame_idx % len(DUCK_FRAMES)]
-                                    anim_text = Text()
-                                    anim_text.append(f"  {frame} ", style="yellow")
-                                    anim_text.append("Processando...", style="dim italic")
-                                    live.update(anim_text)
-                                    frame_idx += 1
-                                    await asyncio.sleep(0.1)
-                                
-                                tool_result_text = await tool_task
-                            
-                            if tool_result_text.startswith("Erro:"):
-                                notify_error(tool_result_text)
-                            else:
-                                console.print(f"  [bold #4ECB71]✓[/bold #4ECB71] [dim]Ferramenta concluída[/dim]")
-
-                            messages.append({"role": "tool", "name": tool_name, "content": tool_result_text, "tool_call_id": tool_call["id"]})
-
-                except KeyboardInterrupt:
-                    console.print("\n[dim italic]Operação cancelada. Digite '/sair' para encerrar.[/dim italic]")
+                    tools_resp = await session.list_tools()
+                    for t in tools_resp.tools:
+                        mcp_tools[t.name] = srv_name
+                        llama_tools.append({
+                            "type": "function",
+                            "function": {"name": t.name, "description": t.description, "parameters": t.inputSchema}
+                        })
                 except Exception as e:
-                    notify_error(f"Erro inesperado: {str(e)}")
+                    notify_error(f"Erro em {srv_name}: {e}")
+
+        n_tools = len(llama_tools)
+        notify_success(f"MCP(s) conectado(s)! {n_tools} ferramentas disponíveis nas sessões ativas.")
+
+        # 2. CONFIGURAÇÃO DE PROMPTS
+        animated_separator("Carregando Configurações", "#A55EEA")
+        saved_agent = autoload_agent()
+        agent_prompt_text = saved_agent if saved_agent else SYSTEM_PROMPT
+        
+        skills_prompts = autoload_skills()
+        
+        messages = [{"role": "system", "content": compor_prompt_sistema(agent_prompt_text, skills_prompts)}]
+        llm = None 
+
+        # 3. CARREGAMENTO DO MODELO
+        llm = await autoload_model()
+        if not llm:
+            animated_separator("Seleção de Modelo", "#FF8E53")
+            llm = await gerenciar_modelos(llm)
+
+        # Menu de comandos estilizado
+        console.print()
+        menu_table = Table(box=None, show_header=False, padding=(0, 2))
+        menu_table.add_column(style="bold #FFC857")
+        menu_table.add_column(style="white")
+        menu_table.add_row("🤖 /models", "Gerenciar modelos de IA")
+        menu_table.add_row("🎭 /multi", "Iniciar o modo multi-agentes simultâneos")
+        menu_table.add_row("🎯 /agents", "Carregar agente personalizado")
+        menu_table.add_row("⚡ /skills", "Carregar skills (ferramentas)")
+        menu_table.add_row("🔌 /mcp", "Gerenciar Servidores MCP")
+        menu_table.add_row("🌐 /server", "Iniciar servidor de API do DuckHunt")
+        menu_table.add_row("🧹 /skills clear", "Limpar todas as skills")
+        menu_table.add_row("🔄 /new", "Reiniciar conversa")
+        menu_table.add_row("↩️  /undo", "Desfazer alterações da última ação do modelo")
+        menu_table.add_row("🦆 /duckroom", "Alternar janela do Duck Room (ex: /duckroom on|off)")
+        menu_table.add_row("❓ /help", "Exibir esta lista de comandos")
+        menu_table.add_row("👋 /sair", "Encerrar aplicação")
+
+        console.print(Panel(
+            menu_table,
+            title="[bold #4ECB71]⌨  Comandos Disponíveis[/bold #4ECB71]",
+            border_style="#4ECB71",
+            expand=False,
+            padding=(1, 2),
+        ))
+        
+        # Barra de status da sessão
+        model_name = llm.model_name if llm else None
+        agent_file = load_config("Agent", "filename")
+        status_bar(model_name, agent_file, skills_prompts if skills_prompts else None)
+
+        # 4. LOOP INFINITO DO CHAT
+        while True:
+            try:
+                console.print()
+                animated_separator(style="dim")
+                
+                # Prompt estilizado com timestamp
+                from datetime import datetime
+                ts = datetime.now().strftime("%H:%M")
+                user_input = Prompt.ask(f"[dim]{ts}[/dim] [bold #45B7D1]Você[/bold #45B7D1] [bold #4ECB71]›[/bold #4ECB71]")
+                cmd = user_input.strip().lower()
+                
+                if cmd in ['/sair', '/exit', '/quit', 'sair', 'exit', 'quit']:
+                    # Animação de despedida
+                    console.print()
+                    farewell = gradient_text("🦆 Até a próxima caçada! Encerrando DuckHunt... 🦆")
+                    console.print(Align.center(farewell))
+                    console.print()
+                    break
+                if cmd == '/server':
+                    console.print()
+                    msg = gradient_text("🌐 Preparando o modo Servidor API... 🌐")
+                    console.print(Align.center(msg))
+                    console.print()
+                    return "START_SERVER"
+                if cmd in ['/models', '/model', '/modelo']:
+                    animated_separator("Seleção de Modelo", "#FF8E53")
+                    llm = await gerenciar_modelos(llm)
+                    model_name = llm.model_name if llm else None
+                    status_bar(model_name, load_config("Agent", "filename"), skills_prompts if skills_prompts else None)
+                    continue
+                if cmd in ['/agents', '/agent', '/agente']:
+                    animated_separator("Seleção de Agente", "#A55EEA")
+                    novo_prompt = gerenciar_agentes(agent_prompt_text)
+                    if novo_prompt != agent_prompt_text:
+                        agent_prompt_text = novo_prompt
+                        messages = [{"role": "system", "content": compor_prompt_sistema(agent_prompt_text, skills_prompts)}]
+                        notify_info("Contexto reiniciado com o novo agente.")
+                    continue
+                if cmd == '/mcp':
+                    gerenciar_mcp()
+                    continue
+                if cmd in ['/skills clear', '/skill clear', '/skillsclear', '/skillclear']:
+                    skills_prompts = []
+                    messages = [{"role": "system", "content": compor_prompt_sistema(agent_prompt_text, skills_prompts)}]
+                    notify_info("Skills removidas. Contexto reiniciado.")
+                    continue
+                
+                if cmd in ['/multi']:
+                    await run_multi_agents(llm, llama_tools, workspace_dir, mcp_sessions, mcp_tools, agent_prompt_text, skills_prompts)
+                    continue
+
+                if cmd in ['/skills', '/skill', '/skill']:
+                    animated_separator("Skills", "#FFC857")
+                    novas = gerenciar_skills()
+                    if novas:
+                        existentes = {s.get("name") for s in skills_prompts}
+                        for sk in novas:
+                            if sk.get("name") not in existentes:
+                                skills_prompts.append(sk)
+                        messages = [{"role": "system", "content": compor_prompt_sistema(agent_prompt_text, skills_prompts)}]
+                        notify_success("Contexto atualizado com novas skills.")
+                    continue
+                
+                if cmd == '/new':
+                    messages = [{"role": "system", "content": compor_prompt_sistema(agent_prompt_text, skills_prompts)}]
+                    notify_info("🔄 Chat reiniciado. Nova conversa iniciada.")
+                    continue
+                
+                if cmd in ['/duckroom on', '/duckroom off']:
+                    if cmd == '/duckroom on':
+                        save_config("General", "duckroom", "on")
+                        notify_success("Duck Room ativado para o modo multi-agentes!")
+                    else:
+                        save_config("General", "duckroom", "off")
+                        notify_success("Duck Room desativado.")
+                    continue
+                
+                if cmd in ['/undo', '/rollback']:
+                    sucesso, msg_status = rollback_checkpoint(workspace_dir)
+                    if sucesso:
+                        notify_success(msg_status)
+                    else:
+                        notify_error(msg_status)
+                    continue
+                
+                if cmd == '/help':
+                    console.print(Panel(
+                        menu_table,
+                        title="[bold #4ECB71]⌨  Comandos Disponíveis[/bold #4ECB71]",
+                        border_style="#4ECB71",
+                        expand=False,
+                        padding=(1, 2),
+                    ))
+                    continue
+
+                if not user_input.strip(): continue
+                if llm is None:
+                    notify_error("Nenhum modelo carregado! Use /models.")
+                    continue
+
+                # Cria checkpoint silencioso antes de processar a chamada do modelo
+                create_checkpoint(workspace_dir)
+
+                # Processa referências a arquivos (ex: #arquivo.txt)
+                file_refs = re.findall(r'(?:^|[\s\(\[\{])#([a-zA-Z0-9_\-\.\/\\]+)', user_input)
+                if file_refs:
+                    contextos = []
+                    for ref in set(file_refs):
+                        file_path = os.path.join(workspace_dir, ref)
+                        if os.path.isfile(file_path):
+                            try:
+                                with open(file_path, 'r', encoding='utf-8') as f:
+                                    conteudo = f.read()
+                                contextos.append(f"--- Conteúdo de {ref} ---\n{conteudo}\n--- Fim de {ref} ---")
+                                notify_info(f"Arquivo referenciado '{ref}' incluído no contexto.")
+                            except Exception as e:
+                                notify_error(f"Erro ao ler '{ref}': {e}")
+                    
+                    if contextos:
+                        user_input += "\n\n[Referências de Arquivos Anexadas Pelo Sistema]\n" + "\n\n".join(contextos)
+
+                messages.append({"role": "user", "content": user_input})
+
+                # LOOP DE RACIOCÍNIO E FERRAMENTAS
+                while True:
+                    # Executa a geração em uma thread para não bloquear o Asyncio
+                    message = await asyncio.to_thread(stream_and_accumulate, llm, messages, llama_tools)
+                    messages.append(message) 
+                    
+                    if "tool_calls" not in message:
+                        break
+                    
+                    # Processa as ferramentas com visual aprimorado
+                    for tool_call in message["tool_calls"]:
+                        tool_name = tool_call["function"]["name"]
+                        tool_args = json.loads(tool_call["function"]["arguments"])
+                        
+                        # Painel de execução da ferramenta
+                        tool_display = Text()
+                        tool_display.append("⚙ - ", style="bold #FF8E53")
+                        tool_display.append(tool_name, style="bold #FFC857")
+                        tool_display.append(f"\n{json.dumps(tool_args, indent=2, ensure_ascii=False)[:200]}", style="dim")
+                        console.print(Panel(
+                            tool_display,
+                            title="[bold #FF8E53]Executando Ferramenta[/bold #FF8E53]",
+                            border_style="#FF8E53",
+                            expand=False,
+                            padding=(0, 1),
+                        ))
+                        
+                        # Animação de pato durante execução da ferramenta
+                        with Live(console=console, refresh_per_second=10) as live:
+                            task_done = False
+                            frame_idx = 0
+                            
+                            async def run_tool():
+                                nonlocal task_done
+                                try:
+                                    target_srv = mcp_tools.get(tool_name)
+                                    if not target_srv or target_srv not in mcp_sessions:
+                                        return f"Erro: Servidor MCP para a ferramenta '{tool_name}' não encontrado."
+                                    sess = mcp_sessions[target_srv]
+                                    result = await sess.call_tool(tool_name, tool_args)
+                                    return "\n".join([c.text for c in result.content if c.type == "text"])
+                                except Exception as e:
+                                    return f"Erro: {str(e)}"
+                                finally:
+                                    task_done = True
+                            
+                            tool_task = asyncio.create_task(run_tool())
+                            
+                            while not task_done:
+                                frame = DUCK_FRAMES[frame_idx % len(DUCK_FRAMES)]
+                                anim_text = Text()
+                                anim_text.append(f"  {frame} ", style="yellow")
+                                anim_text.append("Processando...", style="dim italic")
+                                live.update(anim_text)
+                                frame_idx += 1
+                                await asyncio.sleep(0.1)
+                            
+                            tool_result_text = await tool_task
+                        
+                        if tool_result_text.startswith("Erro:"):
+                            notify_error(tool_result_text)
+                        else:
+                            console.print(f"  [bold #4ECB71]✓[/bold #4ECB71] [dim]Ferramenta concluída[/dim]")
+
+                        messages.append({"role": "tool", "name": tool_name, "content": tool_result_text, "tool_call_id": tool_call["id"]})
+
+            except KeyboardInterrupt:
+                console.print("\n[dim italic]Operação cancelada. Digite '/sair' para encerrar.[/dim italic]")
+            except Exception as e:
+                notify_error(f"Erro inesperado: {str(e)}")
 
 if __name__ == "__main__":
+    start_server = False
     try:
-        asyncio.run(run_chat_loop())
+        result = asyncio.run(run_chat_loop())
+        if result == "START_SERVER":
+            start_server = True
     except KeyboardInterrupt:
         console.print()
         farewell = gradient_text("🦆 Encerrando DuckHunt... Até logo! 🦆")
@@ -1019,6 +1681,15 @@ if __name__ == "__main__":
             for i, ex in enumerate(e.exceptions, 1):
                 console.print(f"[red]  -> {i}. {ex}[/red]")
     finally:
+        if start_server:
+            import subprocess
+            import sys
+            console.print("\n[bold #4ECB71]🚀 Iniciando Uvicorn para DuckHunt API Server em http://0.0.0.0:8000[/bold #4ECB71]")
+            console.print("[dim italic]Pressione Ctrl+C para encerrar[/dim italic]\n")
+            try:
+                subprocess.run([sys.executable, "-m", "uvicorn", "duckhunt_api:api_app", "--host", "0.0.0.0", "--port", "8000"])
+            except KeyboardInterrupt:
+                pass
         try:
             import sys
             sys.exit(0)

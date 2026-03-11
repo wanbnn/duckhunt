@@ -8,6 +8,30 @@
       "env": {
         "WORKSPACE_DIR": ""
       }
+    },
+    "sqlserver": {
+      "command": "python",
+      "args": [
+        "mcp/duck_sqlserver/server.py"
+      ],
+      "env": {
+        "DB_SERVER": "PRIMNO3",
+        "DB_DB": "QUALIDADE_CS",
+        "DB_TRUSTED_CONNECTION": "true",
+        "DB_USER": "",
+        "DB_PASSWORD": "",
+        "DB_ENCRYPT": "true",
+        "DB_TRUST_SERVER_CERTIFICATE": "true"
+      },
+      "disabled": false
+    },
+    "duck_ppt": {
+      "command": "python",
+      "args": [
+        "mcp/duck_ppt/server.py"
+      ],
+      "env": {},
+      "disabled": true
     }
   }
 }
