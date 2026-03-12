@@ -1283,7 +1283,7 @@ def gerenciar_mcp():
                 else:
                     notify_error("ID inválido.")
 
-async def run_multi_agents(llm, tools, workspace_dir, mcp_sessions, mcp_tools, agent_prompt_text, skills_prompts):
+async def run_multi_agents(llm, tools, workspace_dir, mcp_sessions, mcp_tools, mcp_original_names, agent_prompt_text, skills_prompts):
     animated_separator("Multi-Agent Collaboration", C_SECONDARY)
     
     agentes_nomes = []
@@ -1650,7 +1650,8 @@ async def run_multi_agents(llm, tools, workspace_dir, mcp_sessions, mcp_tools, a
                             target_srv = mcp_tools.get(tname)
                             if target_srv and target_srv in mcp_sessions:
                                 sess = mcp_sessions[target_srv]
-                                tool_res = await sess.call_tool(tname, targs)
+                                original_tname = mcp_original_names.get(tname, tname)
+                                tool_res = await sess.call_tool(original_tname, targs)
                                 t_out = "\n".join([c.text for c in tool_res.content if c.type == "text"])
                                 agent_texts[i] += f"\n[{C_SUCCESS}]✓ {tname}[/{C_SUCCESS}]\n"
                                 shared_history.append({"role": "tool", "name": tname, "content": f"Resultado de {tname}:\n{t_out}", "tool_call_id": tc.get("id")})
@@ -1717,6 +1718,7 @@ async def run_chat_loop():
     async with contextlib.AsyncExitStack() as stack:
         mcp_sessions = {}
         mcp_tools = {}
+        mcp_original_names = {}
         llama_tools = []
 
         animated_separator("MCP Protocol")
@@ -1762,10 +1764,15 @@ async def run_chat_loop():
                     
                     tools_resp = await session.list_tools()
                     for t in tools_resp.tools:
-                        mcp_tools[t.name] = srv_name
+                        safe_name = t.name
+                        if safe_name in mcp_tools:
+                            safe_name = f"{srv_name}_{safe_name}"
+                        mcp_tools[safe_name] = srv_name
+                        mcp_original_names[safe_name] = t.name
+                        desc = f"[{srv_name}] {t.description}" if safe_name != t.name else t.description
                         llama_tools.append({
                             "type": "function",
-                            "function": {"name": t.name, "description": t.description, "parameters": t.inputSchema}
+                            "function": {"name": safe_name, "description": desc, "parameters": t.inputSchema}
                         })
                 except Exception as e:
                     notify_error(f"Erro em {srv_name}: {e}")
@@ -1869,7 +1876,7 @@ async def run_chat_loop():
                     continue
                 
                 if cmd in ['/multi']:
-                    await run_multi_agents(llm, llama_tools, workspace_dir, mcp_sessions, mcp_tools, agent_prompt_text, skills_prompts)
+                    await run_multi_agents(llm, llama_tools, workspace_dir, mcp_sessions, mcp_tools, mcp_original_names, agent_prompt_text, skills_prompts)
                     continue
                 
                 if cmd == '/new':
@@ -2021,7 +2028,8 @@ async def run_chat_loop():
                                     if not target_srv or target_srv not in mcp_sessions:
                                         return f"Erro: Servidor MCP para a ferramenta '{tool_name}' não encontrado."
                                     sess = mcp_sessions[target_srv]
-                                    result = await sess.call_tool(tool_name, tool_args)
+                                    original_tname = mcp_original_names.get(tool_name, tool_name)
+                                    result = await sess.call_tool(original_tname, tool_args)
                                     return "\n".join([c.text for c in result.content if c.type == "text"])
                                 except Exception as e:
                                     return f"Erro: {str(e)}"

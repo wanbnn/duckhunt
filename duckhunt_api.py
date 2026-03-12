@@ -33,13 +33,14 @@ _llm = None
 _mcp_stack = None
 _mcp_sessions = {}
 _mcp_tools = {}
+_mcp_original_names = {}
 _llama_tools = []
 _system_prompt = ""
 
 # Configuração do FastAPI
 @contextlib.asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _llm, _mcp_stack, _mcp_sessions, _mcp_tools, _llama_tools, _system_prompt
+    global _llm, _mcp_stack, _mcp_sessions, _mcp_tools, _mcp_original_names, _llama_tools, _system_prompt
     
     # 1. Carrega o Modelo (deve estar configurado no config.ini ou via CLI previamente)
     print("Iniciando DuckHunt API...")
@@ -91,10 +92,15 @@ async def lifespan(app: FastAPI):
                 
                 tools_resp = await session.list_tools()
                 for t in tools_resp.tools:
-                    _mcp_tools[t.name] = srv_name
+                    safe_name = t.name
+                    if safe_name in _mcp_tools:
+                        safe_name = f"{srv_name}_{safe_name}"
+                    _mcp_tools[safe_name] = srv_name
+                    _mcp_original_names[safe_name] = t.name
+                    desc = f"[{srv_name}] {t.description}" if safe_name != t.name else t.description
                     _llama_tools.append({
                         "type": "function",
-                        "function": {"name": t.name, "description": t.description, "parameters": t.inputSchema}
+                        "function": {"name": safe_name, "description": desc, "parameters": t.inputSchema}
                     })
             print(f"Servidores MCP conectados. {len(_llama_tools)} ferramentas disponíveis.")
     except Exception as e:
@@ -184,7 +190,8 @@ async def run_agent_loop(messages: list, stream: bool, max_tokens: int, temperat
                     tool_result_text = f"Erro: Servidor MCP para a ferramenta '{tool_name}' não encontrado."
                 else:
                     sess = _mcp_sessions[target_srv]
-                    result = await sess.call_tool(tool_name, tool_args)
+                    original_tname = _mcp_original_names.get(tool_name, tool_name)
+                    result = await sess.call_tool(original_tname, tool_args)
                     tool_result_text = "\n".join([c.text for c in result.content if c.type == "text"])
             except Exception as e:
                 tool_result_text = f"Erro ao executar ferramenta: {str(e)}"

@@ -292,6 +292,7 @@ class DuckHuntGUI(QMainWindow):
         self.workspace_dir = load_config("General", "workspace") or os.getcwd()
         self.mcp_sessions = {}
         self.mcp_tools = {}
+        self.mcp_original_names = {}
         self.llama_tools = []
         self.llm = None
         self.agent_prompt_text = "You are a senior development assistant running directly in the user's GUI."
@@ -614,10 +615,15 @@ class DuckHuntGUI(QMainWindow):
                     
                     tools_resp = await session.list_tools()
                     for t in tools_resp.tools:
-                        self.mcp_tools[t.name] = srv_name
+                        safe_name = t.name
+                        if safe_name in self.mcp_tools:
+                            safe_name = f"{srv_name}_{safe_name}"
+                        self.mcp_tools[safe_name] = srv_name
+                        self.mcp_original_names[safe_name] = t.name
+                        desc = f"[{srv_name}] {t.description}" if safe_name != t.name else t.description
                         self.llama_tools.append({
                             "type": "function",
-                            "function": {"name": t.name, "description": t.description, "parameters": t.inputSchema}
+                            "function": {"name": safe_name, "description": desc, "parameters": t.inputSchema}
                         })
                 except Exception as e:
                     print(f"Failed to load MCP {srv_name}: {e}")
@@ -864,7 +870,8 @@ class DuckHuntGUI(QMainWindow):
                     result_txt = "Erro: Servidor MCP não conectou para esta ferramenta."
                 else:
                     sess = self.mcp_sessions[srv]
-                    res = await sess.call_tool(tname, targs)
+                    original_tname = self.mcp_original_names.get(tname, tname)
+                    res = await sess.call_tool(original_tname, targs)
                     result_txt = "\n".join([c.text for c in res.content if c.type == "text"])
                 
                 if result_txt.startswith("Erro"):
@@ -1369,7 +1376,8 @@ class DuckHuntGUI(QMainWindow):
                                 self._ma_append(f"⚙️ {a['name']}", f"Executando <b>{tname}</b>...", "#FF8E53")
                                 srv = self.mcp_tools.get(tname)
                                 if srv and srv in self.mcp_sessions:
-                                    tool_res = await self.mcp_sessions[srv].call_tool(tname, targs)
+                                    original_tname = self.mcp_original_names.get(tname, tname)
+                                    tool_res = await self.mcp_sessions[srv].call_tool(original_tname, targs)
                                     t_out = "\n".join([c.text for c in tool_res.content if c.type == "text"])
                                     self._ma_append(f"✅ {a['name']}", f"<b>{tname}</b> concluído.", "#4ECB71")
                                     shared_history.append({"role": "tool", "name": tname, "content": f"Resultado de {tname}:\n{t_out}", "tool_call_id": tc.get("id")})
