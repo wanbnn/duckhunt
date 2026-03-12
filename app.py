@@ -12,7 +12,7 @@ from urllib.parse import urlparse, parse_qs
 import shutil
 import hashlib
 
-# Importações do Rich
+# Rich UI
 from rich.console import Console, Group
 from rich.panel import Panel
 from rich.markdown import Markdown
@@ -24,6 +24,17 @@ from rich.table import Table
 from rich.align import Align
 from rich.rule import Rule
 from rich.style import Style
+from rich.columns import Columns
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn
+
+# Arrow-key interactive menus
+try:
+    from InquirerPy import inquirer
+    from InquirerPy.separator import Separator
+    INQUIRER_AVAILABLE = True
+except Exception as _inq_err:
+    INQUIRER_AVAILABLE = False
+    print(f"[WARN] InquirerPy indisponível ({_inq_err}). Instale com: pip install InquirerPy")
 
 try:
     from llama_cpp import Llama
@@ -43,12 +54,34 @@ from openai import OpenAI, AzureOpenAI
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
-# Inicializa o console do Rich
 console = Console()
 
 # ══════════════════════════════════════════════════════════════
-#  ANIMAÇÕES E EFEITOS VISUAIS
+#  DESIGN SYSTEM — Professional Dark-Mode Palette
 # ══════════════════════════════════════════════════════════════
+
+# Primary palette: cool slate + blue accents (enterprise aesthetic)
+C_PRIMARY    = "#7AA2F7"   # Soft blue — primary actions
+C_SECONDARY  = "#9D7CD8"   # Muted purple — secondary/agent
+C_ACCENT     = "#73DACA"   # Teal — success/highlights
+C_WARNING    = "#E0AF68"   # Warm amber — warnings
+C_ERROR      = "#F7768E"   # Soft red — errors
+C_DIM        = "#565F89"   # Slate gray — muted text
+C_TEXT       = "#C0CAF5"   # Light blue-white — main text
+C_SURFACE    = "#1A1B26"   # Dark background (reference)
+C_BORDER     = "#3B4261"   # Panel borders
+C_HIGHLIGHT  = "#BB9AF7"   # Highlight/selection
+C_SUCCESS    = "#9ECE6A"   # Green — confirmations
+C_TOOL       = "#FF9E64"   # Orange — tool execution
+
+# Gradient for branding text (subtle cool tones)
+GRADIENT_COLORS = [
+    "#7AA2F7", "#7DCFFF", "#73DACA", "#9ECE6A",
+    "#BB9AF7", "#9D7CD8", "#7AA2F7", "#7DCFFF",
+]
+
+# Loading animation frames (clean dots instead of duck spam)
+SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
 DUCK_FRAMES = [
     "  🦆        ",
@@ -65,13 +98,10 @@ DUCK_FRAMES = [
     "   🦆       ",
 ]
 
-GRADIENT_COLORS = [
-    "#FF6B6B", "#FF8E53", "#FFC857", "#4ECB71",
-    "#45B7D1", "#6C5CE7", "#A55EEA", "#FF6B6B",
-]
+PROGRESS_BAR = ["░", "▒", "▓", "█"]
 
 def gradient_text(text_str, colors=None):
-    """Cria texto com efeito gradiente."""
+    """Cria texto com efeito gradiente sutil."""
     if colors is None:
         colors = GRADIENT_COLORS
     t = Text()
@@ -81,61 +111,59 @@ def gradient_text(text_str, colors=None):
     return t
 
 def notify_success(msg):
-    """Notificação de sucesso estilizada."""
     console.print(
         Panel(
-            f"[bold green]✅ {msg}[/bold green]",
-            border_style="green",
+            Text.from_markup(f"[bold {C_SUCCESS}]✓ {msg}[/bold {C_SUCCESS}]"),
+            border_style=C_ACCENT,
             padding=(0, 1),
             expand=False,
         )
     )
 
 def notify_error(msg):
-    """Notificação de erro estilizada."""
     console.print(
         Panel(
-            f"[bold red]❌ {msg}[/bold red]",
-            border_style="red",
+            Text.from_markup(f"[bold {C_ERROR}]✗ {msg}[/bold {C_ERROR}]"),
+            border_style=C_ERROR,
             padding=(0, 1),
             expand=False,
         )
     )
 
 def notify_info(msg):
-    """Notificação informativa estilizada."""
     console.print(
         Panel(
-            f"[bold cyan]💡 {msg}[/bold cyan]",
-            border_style="cyan",
+            Text.from_markup(f"[{C_PRIMARY}]› {msg}[/{C_PRIMARY}]"),
+            border_style=C_DIM,
             padding=(0, 1),
             expand=False,
         )
     )
 
-def animated_separator(label="", style="cyan"):
-    """Separador animado com label."""
+def animated_separator(label="", style=None):
+    if style is None:
+        style = C_BORDER
     if label:
-        console.print(Rule(f"[bold {style}]{label}[/bold {style}]", style=style))
+        console.print(Rule(f"[bold {C_TEXT}]{label}[/bold {C_TEXT}]", style=style, characters="─"))
     else:
-        console.print(Rule(style=style))
+        console.print(Rule(style=C_DIM, characters="─"))
 
 def status_bar(model_name=None, agent_name=None, skills_list=None):
-    """Mostra uma barra de status compacta com info da sessão."""
+    """Barra de status compacta e profissional."""
     parts = []
     if model_name:
-        parts.append(f"[bold #45B7D1]🤖 {model_name}[/bold #45B7D1]")
+        parts.append(f"[bold {C_PRIMARY}]⬡ MODEL [/bold {C_PRIMARY}][{C_TEXT}]{model_name}[/{C_TEXT}]")
     else:
-        parts.append("[dim]🤖 Sem modelo[/dim]")
+        parts.append(f"[{C_DIM}]⬡ MODEL — none[/{C_DIM}]")
     if agent_name:
-        parts.append(f"[bold #A55EEA]🎯 {agent_name}[/bold #A55EEA]")
+        parts.append(f"[bold {C_SECONDARY}]◈ AGENT [/bold {C_SECONDARY}][{C_TEXT}]{agent_name}[/{C_TEXT}]")
     if skills_list:
         names = ", ".join([s.get('name', '?') for s in skills_list])
-        parts.append(f"[bold #FFC857]⚡ {names}[/bold #FFC857]")
+        parts.append(f"[bold {C_ACCENT}]⚡ SKILLS [/bold {C_ACCENT}][{C_TEXT}]{names}[/{C_TEXT}]")
     console.print(
         Panel(
-            " │ ".join(parts),
-            border_style="dim",
+            "  │  ".join(parts),
+            border_style=C_BORDER,
             padding=(0, 1),
             expand=True,
         )
@@ -361,9 +389,22 @@ class UnifiedLLM:
         choice = chunk.choices[0]
         delta = choice.delta
         delta_dict = {}
-        if delta.content is not None: delta_dict["content"] = delta.content
+        if hasattr(delta, "content") and delta.content is not None: 
+            delta_dict["content"] = delta.content
+            
+        # Preserve Gemini thought signatures (extra_content) in assistant messages
+        # This is REQUIRED for Gemini tools to work in follow-up calls
+        if hasattr(delta, "extra_content") and delta.extra_content:
+            # Ensure extra_content is a dictionary if we intend to update it
+            if isinstance(delta.extra_content, dict):
+                delta_dict.setdefault("extra_content", {}).update(delta.extra_content)
+            else:
+                delta_dict["extra_content"] = delta.extra_content
+
         if getattr(delta, "tool_calls", None):
-            delta_dict["tool_calls"] = []
+            # Initialize tool_calls list if it doesn't exist in delta_dict
+            if "tool_calls" not in delta_dict:
+                delta_dict["tool_calls"] = []
             for tc in delta.tool_calls:
                 if hasattr(tc, "model_dump"):
                     tc_dict = tc.model_dump(exclude_unset=True)
@@ -375,55 +416,79 @@ class UnifiedLLM:
                         tc_dict["function"] = {}
                         if getattr(tc.function, "name", None): tc_dict["function"]["name"] = tc.function.name
                         if getattr(tc.function, "arguments", None): tc_dict["function"]["arguments"] = tc.function.arguments
+                    # Preserve extra_content inside individual tool calls if present
+                    ext = getattr(tc, "extra_content", None)
+                    if ext:
+                        # Ensure extra_content is a dictionary if we intend to update it
+                        if isinstance(ext, dict):
+                            tc_dict.setdefault("extra_content", {}).update(ext)
+                        else:
+                            tc_dict["extra_content"] = ext
                 delta_dict["tool_calls"].append(tc_dict)
         return {"choices": [{"delta": delta_dict, "finish_reason": choice.finish_reason}]}
 
-def gerenciar_agentes(current_prompt: str) -> str:
+async def gerenciar_agentes(current_prompt: str) -> str:
     try:
         if not os.path.exists(AGENTS_DIR):
-            console.print(f"\n[red]Pasta de agentes não encontrada em '{AGENTS_DIR}'.[/red]")
+            notify_error(f"Pasta de agentes não encontrada em '{AGENTS_DIR}'.")
             return current_prompt
 
         agentes = [f for f in os.listdir(AGENTS_DIR) if f.lower().endswith(".md")]
         if not agentes:
-            console.print(f"\n[red]Nenhum agente (.md) encontrado em '{AGENTS_DIR}'.[/red]\n")
+            notify_error(f"Nenhum agente (.md) encontrado em '{AGENTS_DIR}'.")
             return current_prompt
 
-        table = Table(title="🎯 Agentes Disponíveis", title_style="bold #A55EEA", border_style="#A55EEA")
-        table.add_column("ID", justify="center", style="bold #45B7D1", no_wrap=True)
-        table.add_column("Nome do Arquivo", style="white")
-
-        for i, nome in enumerate(agentes, 1):
-            table.add_row(str(i), nome)
-        
-        console.print(table)
-        console.print("  [dim][[/dim][bold #FF6B6B]c[/bold #FF6B6B][dim]] Cancelar[/dim]")
-
-        while True:
-            escolha = Prompt.ask("\n[bold #A55EEA]Escolha o agente[/bold #A55EEA]").strip().lower()
-            if escolha == 'c':
-                console.print("[dim italic]Seleção cancelada.[/dim italic]")
+        # Arrow-key selection with InquirerPy
+        if INQUIRER_AVAILABLE:
+            choices = [{"name": f"  ◈ {a.replace('.md', '')}", "value": a} for a in agentes]
+            choices.append(Separator("─" * 40))
+            choices.append({"name": f"  ✗ Cancelar", "value": None})
+            
+            arquivo = await inquirer.select(
+                message="Selecione o agente",
+                choices=choices,
+                pointer="▸",
+                qmark="◈",
+                amark="✓",
+                instruction="(↑↓ navegar, Enter selecionar)",
+            ).execute_async()
+            
+            if arquivo is None:
                 return current_prompt
-            if escolha.isdigit() and 0 <= int(escolha) - 1 < len(agentes):
-                arquivo = agentes[int(escolha) - 1]
-                try:
-                    with open(os.path.join(AGENTS_DIR, arquivo), 'r', encoding='utf-8') as f:
-                        conteudo = f.read()
-                    notify_success(f"Agente '{arquivo}' carregado!")
-                    save_config("Agent", "filename", arquivo)
-                    return conteudo
-                except Exception as e:
-                    notify_error(f"Erro ao ler o agente: {e}")
-                    return current_prompt
-            else:
-                console.print("[red]Opção inválida.[/red]")
+        else:
+            # Fallback: numbered list
+            table = Table(title="◈ Agentes Disponíveis", title_style=f"bold {C_SECONDARY}", border_style=C_BORDER)
+            table.add_column("", justify="center", style=f"bold {C_PRIMARY}", no_wrap=True, width=4)
+            table.add_column("Agente", style=C_TEXT)
+            for i, nome in enumerate(agentes, 1):
+                table.add_row(str(i), nome.replace('.md', ''))
+            console.print(table)
+
+            escolha = Prompt.ask(f"\n[{C_SECONDARY}]Escolha o agente[/{C_SECONDARY}] [{C_DIM}](c=cancelar)[/{C_DIM}]").strip().lower()
+            if escolha == 'c':
+                return current_prompt
+            if not escolha.isdigit() or not (0 <= int(escolha) - 1 < len(agentes)):
+                notify_error("Opção inválida.")
+                return current_prompt
+            arquivo = agentes[int(escolha) - 1]
+        
+        try:
+            with open(os.path.join(AGENTS_DIR, arquivo), 'r', encoding='utf-8') as f:
+                conteudo = f.read()
+            notify_success(f"Agente '{arquivo.replace('.md', '')}' ativado")
+            save_config("Agent", "filename", arquivo)
+            return conteudo
+        except Exception as e:
+            notify_error(f"Erro ao ler o agente: {e}")
+            return current_prompt
     except KeyboardInterrupt:
         return current_prompt
 
-def gerenciar_skills() -> list | None:
+async def gerenciar_skills(current_skills: list = None) -> list | str | None:
+    """Retorna lista de skills selecionadas, 'CLEAR' para limpar, ou None para cancelar."""
     try:
         if not os.path.exists(SKILLS_DIR):
-            console.print(f"\n[red]Pasta de skills não encontrada em '{SKILLS_DIR}'.[/red]")
+            notify_error(f"Pasta de skills não encontrada em '{SKILLS_DIR}'.")
             return None
 
         encontrados = []
@@ -432,65 +497,167 @@ def gerenciar_skills() -> list | None:
                 if f.lower() == 'skill.md':
                     encontrados.append((os.path.relpath(root, SKILLS_DIR), os.path.join(root, f)))
 
-        if not encontrados:
-            console.print("\n[red]Nenhuma skill encontrada.[/red]\n")
+        if not encontrados and not current_skills:
+            notify_error("Nenhuma skill encontrada.")
             return None
 
-        table = Table(title="⚡ Skills Disponíveis", title_style="bold #FFC857", border_style="#FFC857")
-        table.add_column("ID", justify="center", style="bold #45B7D1", no_wrap=True)
-        table.add_column("Caminho", style="white")
+        has_loaded = current_skills and len(current_skills) > 0
 
-        for i, (rel, _) in enumerate(encontrados, 1):
-            table.add_row(str(i), rel)
-        
-        console.print(table)
-        console.print("  [dim][[/dim][bold #FF6B6B]c[/bold #FF6B6B][dim]] Cancelar[/dim]")
+        # InquirerPy checkbox
+        if INQUIRER_AVAILABLE:
+            choices = []
+            # "Clear" option first if skills are loaded
+            if has_loaded:
+                loaded_names = ", ".join([s.get("name", "?") for s in current_skills])
+                choices.append({"name": f"  ✗ Limpar skills carregadas ({loaded_names})", "value": "CLEAR"})
+                choices.append(Separator("─" * 40))
+            for idx, (rel, _) in enumerate(encontrados):
+                choices.append({"name": f"  ⚡ {rel}", "value": idx})
+            
+            selected = await inquirer.checkbox(
+                message="Skills",
+                choices=choices,
+                pointer="▸",
+                qmark="⚡",
+                amark="✓",
+                enabled_symbol="◉",
+                disabled_symbol="○",
+                instruction="(↑↓ navegar, Space marcar, Enter confirmar)",
+            ).execute_async()
+            
+            if not selected:
+                return None
+            if "CLEAR" in selected:
+                return "CLEAR"
+            indices = selected
+        else:
+            # Fallback: numbered table
+            table = Table(title="⚡ Skills", title_style=f"bold {C_ACCENT}", border_style=C_BORDER)
+            table.add_column("", justify="center", style=f"bold {C_PRIMARY}", no_wrap=True, width=4)
+            table.add_column("Skill", style=C_TEXT)
+            
+            offset = 0
+            if has_loaded:
+                loaded_names = ", ".join([s.get("name", "?") for s in current_skills])
+                table.add_row("0", f"[{C_ERROR}]✗ Limpar skills ({loaded_names})[/{C_ERROR}]")
+                offset = 0  # 0 = clear
+            
+            for i, (rel, _) in enumerate(encontrados, 1):
+                table.add_row(str(i), rel)
+            console.print(table)
 
-        while True:
-            escolha = Prompt.ask("\n[bold #FFC857]Selecione skills (ex.: 1,3,5)[/bold #FFC857]").strip().lower()
+            escolha = Prompt.ask(f"\n[{C_ACCENT}]Selecione skills (ex.: 1,3)[/{C_ACCENT}] [{C_DIM}](c=cancelar)[/{C_DIM}]").strip().lower()
             if escolha == 'c': return None
             
-            indices = [int(t)-1 for t in escolha.replace(',', ' ').split() if t.isdigit()]
-            selecionados = []
-            
-            for idx in set(indices):
-                if 0 <= idx < len(encontrados):
-                    rel, caminho = encontrados[idx]
-                    try:
-                        # Captura o diretório pai do skill.md (a raiz da skill)
-                        skill_root_dir = os.path.abspath(os.path.dirname(caminho))
-                        with open(caminho, 'r', encoding='utf-8') as f:
-                            selecionados.append({
-                                "name": rel, 
-                                "content": f.read(),
-                                "path": skill_root_dir  # <-- ADICIONADO: Caminho real no disco
-                            })
-                    except Exception as e:
-                        console.print(f"[red]Erro na skill '{rel}': {e}[/red]")
+            nums = [int(t) for t in escolha.replace(',', ' ').split() if t.isdigit()]
+            if 0 in nums and has_loaded:
+                return "CLEAR"
+            indices = [n - 1 for n in nums]
 
-            if selecionados:
-                nomes = ", ".join([s["name"] for s in selecionados])
-                notify_success(f"Skills carregadas: {nomes}")
-                save_config("Skills", "loaded", nomes)
-                return selecionados
-            console.print("[red]Entrada inválida.[/red]")
+        selecionados = []
+        for idx in set(indices):
+            if 0 <= idx < len(encontrados):
+                rel, caminho = encontrados[idx]
+                try:
+                    skill_root_dir = os.path.abspath(os.path.dirname(caminho))
+                    with open(caminho, 'r', encoding='utf-8') as f:
+                        selecionados.append({
+                            "name": rel, 
+                            "content": f.read(),
+                            "path": skill_root_dir
+                        })
+                except Exception as e:
+                    notify_error(f"Erro na skill '{rel}': {e}")
+
+        if selecionados:
+            nomes = ", ".join([s["name"] for s in selecionados])
+            notify_success(f"Skills ativadas: {nomes}")
+            save_config("Skills", "loaded", nomes)
+            return selecionados
+        notify_error("Nenhuma skill válida selecionada.")
+        return None
     except KeyboardInterrupt:
         return None
 
-def compor_prompt_sistema(agent_prompt_text: str, skills_prompts: list) -> str:
-    base = agent_prompt_text or ""
-    if not skills_prompts: return base
-    
-    partes = [base, "\n\n### ACTIVE SKILLS (EXTENSIONS)\n"]
-    partes.append("The following skills are loaded. When executing scripts or accessing files from these skills, use the 'Base Directory' provided for each.\n")
-    
-    for sp in skills_prompts:
-        partes.append(f"\n--- Skill: {sp.get('name', '(skill)')} ---")
-        partes.append(f"\n[Base Directory]: {sp.get('path')}") # <-- O LLM agora "vê" o caminho
-        partes.append(f"\n[Instructions]:\n{sp.get('content', '')}\n")
-        
-    return "".join(partes)
+def get_unloaded_skills_info(skills_prompts: list) -> list:
+    loaded_names = {sp.get("name") for sp in (skills_prompts or [])}
+    unloaded = []
+    if os.path.exists(SKILLS_DIR):
+        for root, _dirs, files in os.walk(SKILLS_DIR):
+            for f in files:
+                if f.lower() == 'skill.md':
+                    rel_name = os.path.relpath(root, SKILLS_DIR)
+                    if rel_name in loaded_names:
+                        continue
+                    
+                    caminho = os.path.join(root, f)
+                    try:
+                        with open(caminho, 'r', encoding='utf-8') as sf:
+                            content = sf.read()
+                            
+                        # Try to extract description from frontmatter
+                        description = "Nenhuma descrição disponível."
+                        desc_match = re.search(r'^description:\s*(.+)$', content, re.MULTILINE)
+                        if desc_match:
+                            description = desc_match.group(1).strip()
+                            
+                        unloaded.append({"name": rel_name, "description": description})
+                    except Exception:
+                        pass
+    return unloaded
 
+def load_skill_by_name(skill_name: str, skills_prompts: list) -> bool:
+    if not os.path.exists(SKILLS_DIR):
+        return False
+        
+    for root, _dirs, files in os.walk(SKILLS_DIR):
+        for f in files:
+            if f.lower() == 'skill.md':
+                rel_name = os.path.relpath(root, SKILLS_DIR)
+                if rel_name == skill_name:
+                    # check if already loaded
+                    if any(sp.get("name") == skill_name for sp in skills_prompts):
+                        return True
+                        
+                    caminho = os.path.join(root, f)
+                    try:
+                        with open(caminho, 'r', encoding='utf-8') as sf:
+                            content = sf.read()
+                        
+                        skill_root_dir = os.path.abspath(os.path.dirname(caminho))
+                        skills_prompts.append({
+                            "name": rel_name,
+                            "content": content,
+                            "path": skill_root_dir
+                        })
+                        save_config("Skills", "loaded", ", ".join([s["name"] for s in skills_prompts]))
+                        return True
+                    except Exception as e:
+                        notify_error(f"Erro ao carregar skill '{skill_name}': {e}")
+                        return False
+    return False
+
+def compor_prompt_sistema(agent_prompt_text: str, skills_prompts: list) -> str:
+    partes = [agent_prompt_text or ""]
+    
+    if skills_prompts:
+        partes.append("\n\n### ACTIVE SKILLS (EXTENSIONS)\n")
+        partes.append("The following skills are loaded. When executing scripts or accessing files from these skills, use the 'Base Directory' provided for each.\n")
+        
+        for sp in skills_prompts:
+            partes.append(f"\n--- Skill: {sp.get('name', '(skill)')} ---")
+            partes.append(f"\n[Base Directory]: {sp.get('path')}") 
+            partes.append(f"\n[Instructions]:\n{sp.get('content', '')}\n")
+            
+    unloaded = get_unloaded_skills_info(skills_prompts)
+    if unloaded:
+        partes.append("\n\n### AVAILABLE SKILLS (UNLOADED)\n")
+        partes.append("You have the ability to dynamically load specialized skills into your context when needed using the `load_duckhunt_skill` tool. These skills provide specialized knowledge and tools for specific tasks.\n")
+        partes.append("Available skills:\n")
+        for u in unloaded:
+            partes.append(f"- **{u['name']}**: {u['description']}\n")
+            
+    return "".join(partes)
 def stream_and_accumulate(llm, messages, tools):
     """
     Renderiza o pensamento em um painel e a resposta normal em Markdown em tempo real.
@@ -596,6 +763,20 @@ def stream_and_accumulate(llm, messages, tools):
                                     tc_acc[k] = tc_acc.get(k, "") + v
                                 else:
                                     tc_acc[k] = v
+                                    
+                    # Accumulate extra_content for Gemini
+                    if "extra_content" in tc_chunk and tc_chunk["extra_content"]:
+                        if "extra_content" not in tc_acc or not isinstance(tc_acc["extra_content"], dict): 
+                            tc_acc["extra_content"] = {}
+                        if isinstance(tc_chunk["extra_content"], dict):
+                            tc_acc["extra_content"].update(tc_chunk["extra_content"])
+                        
+            # Accumulate top-level extra_content for Gemini
+            if "extra_content" in delta and delta["extra_content"]:
+                if "extra_content" not in message or not isinstance(message["extra_content"], dict): 
+                    message["extra_content"] = {}
+                if isinstance(delta["extra_content"], dict):
+                    message["extra_content"].update(delta["extra_content"])
                         
     # --- FALLBACK: PARSER MANUAL DE TOOL CALL ---
     if not message["tool_calls"] and "<tool_call>" in message["content"]:
@@ -648,18 +829,16 @@ def banner():
     """
     text = Text.from_ansi(bn)
     
-    # Subtítulo com gradiente
-    sub = gradient_text("⚡ DuckHunt AI Agent — Terminal Intelligence ⚡")
+    sub = gradient_text("DuckHunt AI Agent — Terminal Intelligence")
     
-    # Badge de versão e status
     ver_line = Text()
-    ver_line.append("  ◆ ", style="dim")
-    ver_line.append("v1.0.4", style="bold #FF6B6B")
-    ver_line.append("  •  ", style="dim")
-    ver_line.append("Ready", style="bold #4ECB71")
-    ver_line.append("  •  ", style="dim")
-    ver_line.append("Powered by DuckTools", style="bold #45B7D1")
-    ver_line.append("  ◆", style="dim")
+    ver_line.append("  ─ ", style=C_DIM)
+    ver_line.append("v2.0.0", style=f"bold {C_PRIMARY}")
+    ver_line.append("  •  ", style=C_DIM)
+    ver_line.append("● Ready", style=f"bold {C_SUCCESS}")
+    ver_line.append("  •  ", style=C_DIM)
+    ver_line.append("Powered by DuckTools", style=f"{C_DIM}")
+    ver_line.append("  ─", style=C_DIM)
     
     content = Group(
         Align.center(text),
@@ -670,38 +849,45 @@ def banner():
 
     return Panel(
         content,
-        border_style="bold #FF6B6B",
-        title="[bold #FFC857]🎯 System Ready[/bold #FFC857]",
-        subtitle="[dim italic]press /help for commands[/dim italic]",
+        border_style=C_BORDER,
+        title=f"[bold {C_ACCENT}]◈ System Ready[/bold {C_ACCENT}]",
+        subtitle=f"[{C_DIM}]/help for commands[/{C_DIM}]",
         padding=(0, 1),
     )
 
 def animated_startup():
-    """Animação de startup com efeito de loading."""
+    """Animação de startup com progress bar profissional."""
     startup_steps = [
-        ("🔧", "Inicializando núcleo...", "#FF6B6B"),
-        ("🧠", "Carregando engine de IA...", "#FF8E53"),
-        ("🔌", "Preparando conexões MCP...", "#FFC857"),
-        ("🦆", "DuckHunt pronto para caçar!", "#4ECB71"),
+        ("▸", "Inicializando núcleo", C_PRIMARY),
+        ("▸", "Carregando engine de IA", C_SECONDARY),
+        ("▸", "Preparando conexões MCP", C_ACCENT),
+        ("▸", "Sistema operacional", C_SUCCESS),
     ]
     
-    with Live(console=console, refresh_per_second=15) as live:
-        for icon, step_text, color in startup_steps:
-            # Animação de patos voando durante loading
-            for frame_idx in range(6):
-                duck_anim = DUCK_FRAMES[frame_idx % len(DUCK_FRAMES)]
-                display = Text()
-                display.append(f"\n  {icon} ", style=f"bold {color}")
-                display.append(step_text, style=f"{color}")
-                display.append(f"\n  {duck_anim}", style="yellow")
+    with Live(console=console, refresh_per_second=20) as live:
+        completed = []
+        for step_idx, (icon, step_text, color) in enumerate(startup_steps):
+            for frame_idx in range(8):
+                spinner = SPINNER_FRAMES[frame_idx % len(SPINNER_FRAMES)]
+                progress_pct = int(((step_idx * 8 + frame_idx) / (len(startup_steps) * 8)) * 100)
+                bar_filled = int(progress_pct / 2.5)
+                bar = f"[{C_PRIMARY}]{'█' * bar_filled}{'░' * (40 - bar_filled)}[/{C_PRIMARY}] [{C_DIM}]{progress_pct}%[/{C_DIM}]"
+                
+                lines = Text()
+                for done_text, done_color in completed:
+                    lines.append(f"  ✓ {done_text}\n", style=f"{done_color} dim")
+                lines.append(f"  {spinner} {step_text}...\n", style=f"bold {color}")
+                
+                display = Group(lines, Text.from_markup(f"  {bar}"))
                 live.update(
-                    Panel(display, border_style="dim", expand=False, padding=(0, 1))
+                    Panel(display, border_style=C_BORDER, expand=False, padding=(0, 2), title=f"[{C_DIM}]Startup[/{C_DIM}]")
                 )
-                time.sleep(0.06)
+                time.sleep(0.04)
+            completed.append((step_text, color))
     console.print()
 
 async def adicionar_nova_api():
-    console.print("\n[bold #A55EEA]➕ Adicionar Nova API[/bold #A55EEA]")
+    console.print(f"\n[bold {C_SECONDARY}]◈ Adicionar Nova API[/bold {C_SECONDARY}]")
     
     tipo = Prompt.ask(
         "[yellow]Escolha o tipo de API[/yellow]", 
@@ -787,18 +973,18 @@ async def gerenciar_modelos(current_llm):
                 opcoes.append({"label": f"[Local - INDISPONÍVEL] {m} (llama-cpp não instalado)", "value": None})
         
         console.print()
-        table = Table(title="🤖 Modelos Disponíveis", title_style="bold #FF8E53", border_style="#FF8E53")
-        table.add_column("ID", justify="center", style="bold #45B7D1", no_wrap=True)
-        table.add_column("Modelo", style="white")
+        table = Table(title="⬡ Modelos Disponíveis", title_style=f"bold {C_PRIMARY}", border_style=C_BORDER)
+        table.add_column("", justify="center", style=f"bold {C_PRIMARY}", no_wrap=True, width=4)
+        table.add_column("Modelo", style=C_TEXT)
 
         if not opcoes:
-            table.add_row("-", "Nenhum modelo configurado.")
+            table.add_row("-", f"[{C_DIM}]Nenhum modelo configurado.[/{C_DIM}]")
         else:
             for i, opt in enumerate(opcoes, 1):
                 table.add_row(str(i), opt['label'])
 
         console.print(table)
-        console.print("  [dim][[/dim][bold #FF6B6B]c[/bold #FF6B6B][dim]] Cancelar[/dim]   [dim][[/dim][bold #4ECB71]a[/bold #4ECB71][dim]] Adicionar API[/dim]   [dim][[/dim][bold #FFC857]e[/bold #FFC857][dim]] Editar API[/dim]   [dim][[/dim][bold #FF6B6B]r[/bold #FF6B6B][dim]] Remover API[/dim]")
+        console.print(f"  [{C_DIM}][[/{C_DIM}][bold {C_ERROR}]c[/bold {C_ERROR}][{C_DIM}]] Cancelar   [[/{C_DIM}][bold {C_SUCCESS}]a[/bold {C_SUCCESS}][{C_DIM}]] Add API   [[/{C_DIM}][bold {C_WARNING}]e[/bold {C_WARNING}][{C_DIM}]] Editar   [[/{C_DIM}][bold {C_ERROR}]r[/bold {C_ERROR}][{C_DIM}]] Remover[/{C_DIM}]")
         
         escolha = Prompt.ask("\n[yellow]Digite o número do modelo para usar ou a opção desejada (c/a/e/r)[/yellow]").strip().lower()
         if escolha == 'c': return current_llm
@@ -1098,54 +1284,147 @@ def gerenciar_mcp():
                     notify_error("ID inválido.")
 
 async def run_multi_agents(llm, tools, workspace_dir, mcp_sessions, mcp_tools, agent_prompt_text, skills_prompts):
-    console.print("\n[bold #A55EEA]🤖 Modo Multi-Agent Iniciado[/bold #A55EEA]")
+    animated_separator("Multi-Agent Collaboration", C_SECONDARY)
     
     agentes_nomes = []
     agentes_prompts = []
+    
+    # Agent color palette for distinct visual identity per agent
+    AGENT_COLORS = [C_PRIMARY, C_SECONDARY, C_ACCENT, C_WARNING, C_TOOL, C_HIGHLIGHT]
+    AGENT_ICONS  = ["◆", "◇", "▸", "▹", "◈", "◉"]
     
     agentes_files = []
     if os.path.exists(AGENTS_DIR):
         agentes_files = [f for f in os.listdir(AGENTS_DIR) if f.lower().endswith(".md")]
         
-    if agentes_files:
-        table = Table(title="🎯 Agentes Disponíveis na Pasta", title_style="bold #A55EEA", border_style="#A55EEA")
-        table.add_column("ID", justify="center", style="bold #45B7D1", no_wrap=True)
-        table.add_column("Nome do Agente", style="white")
+    if agentes_files and INQUIRER_AVAILABLE:
+        # Legend panel explaining controls
+        legend = Text()
+        legend.append("  ↑ ↓  ", style=f"bold {C_PRIMARY}")
+        legend.append("Navegar entre agentes\n", style=C_TEXT)
+        legend.append("  Tab  ", style=f"bold {C_ACCENT}")
+        legend.append("Marcar / desmarcar agente\n", style=C_TEXT)
+        legend.append("  Enter", style=f"bold {C_SUCCESS}")
+        legend.append("  Confirmar seleção\n", style=C_TEXT)
+        legend.append("  Esc  ", style=f"bold {C_ERROR}")
+        legend.append("Cancelar e voltar ao chat", style=C_TEXT)
+        console.print(Panel(
+            legend,
+            title=f"[bold {C_DIM}]Controles[/bold {C_DIM}]",
+            border_style=C_BORDER,
+            expand=False,
+            padding=(0, 2),
+        ))
+        
+        choices = [{"name": f"  {AGENT_ICONS[i % len(AGENT_ICONS)]} {a.replace('.md', '')}", "value": a} for i, a in enumerate(agentes_files)]
+        
+        inquirer_ok = False
+        try:
+            selected = await inquirer.checkbox(
+                message="Selecione os agentes para colaboração",
+                choices=choices,
+                pointer="▸",
+                qmark="◈",
+                amark="✓",
+                enabled_symbol="◉",
+                disabled_symbol="○",
+                instruction="",
+                long_instruction="Tab=marcar  Enter=confirmar  Esc=cancelar",
+                mandatory=False,
+                raise_keyboard_interrupt=False,
+                keybindings={
+                    "toggle": [{"key": "tab"}],
+                },
+                border=True,
+            ).execute_async()
+            inquirer_ok = True
+        except (KeyboardInterrupt, EOFError):
+            selected = None
+            inquirer_ok = True
+        except Exception:
+            # prompt_toolkit console error — fall through to table fallback
+            inquirer_ok = False
+        
+        if inquirer_ok:
+            if not selected:
+                notify_info("Seleção cancelada.")
+                return
+            for fname in selected:
+                nome = fname.replace(".md", "")
+                agentes_nomes.append(nome)
+                try:
+                    with open(os.path.join(AGENTS_DIR, fname), 'r', encoding='utf-8') as f:
+                        agentes_prompts.append(f.read())
+                except Exception:
+                    agentes_prompts.append(agent_prompt_text)
+    
+    # Fallback: table + text input (when InquirerPy unavailable or console error)
+    if not agentes_nomes and agentes_files:
+        table = Table(title="◈ Agentes Disponíveis", title_style=f"bold {C_SECONDARY}", border_style=C_BORDER)
+        table.add_column("", justify="center", style=f"bold {C_PRIMARY}", no_wrap=True, width=4)
+        table.add_column("Agente", style=C_TEXT)
         for i, anome in enumerate(agentes_files, 1):
             table.add_row(str(i), anome.replace(".md", ""))
         console.print(table)
-        console.print("[dim]Você pode digitar IDs (ex: 1,3) ou customizar os nomes/funções (ex: Product Owner)[/dim]")
+        console.print(f"\n  [{C_DIM}]↑↓ = navegar   Tab = marcar   Enter = confirmar   Esc = cancelar[/{C_DIM}]")
+        console.print(f"  [{C_DIM}]Ou digite IDs separados por vírgula (ex: 1,3,5)[/{C_DIM}]")
         
-    agentes_input = Prompt.ask("\n[yellow]Digite os IDs ou nomes dos agentes separados por vírgula[/yellow]")
-    if not agentes_input.strip(): return
-    
-    for item in agentes_input.split(","):
-        item = item.strip()
-        if not item: continue
+        agentes_input = Prompt.ask(f"\n[{C_SECONDARY}]Agentes[/{C_SECONDARY}]")
+        if not agentes_input.strip(): return
         
-        if item.isdigit() and 0 <= int(item) - 1 < len(agentes_files):
-            fname = agentes_files[int(item) - 1]
-            nome = fname.replace(".md", "")
-            agentes_nomes.append(nome)
-            try:
-                with open(os.path.join(AGENTS_DIR, fname), 'r', encoding='utf-8') as f:
-                    agentes_prompts.append(f.read())
-            except Exception:
+        for item in agentes_input.split(","):
+            item = item.strip()
+            if not item: continue
+            if item.isdigit() and 0 <= int(item) - 1 < len(agentes_files):
+                fname = agentes_files[int(item) - 1]
+                nome = fname.replace(".md", "")
+                agentes_nomes.append(nome)
+                try:
+                    with open(os.path.join(AGENTS_DIR, fname), 'r', encoding='utf-8') as f:
+                        agentes_prompts.append(f.read())
+                except Exception:
+                    agentes_prompts.append(agent_prompt_text)
+            else:
+                agentes_nomes.append(item)
                 agentes_prompts.append(agent_prompt_text)
-        else:
-            agentes_nomes.append(item)
-            agentes_prompts.append(agent_prompt_text)
+    
+    if not agentes_files:
+        notify_error("Nenhum agente encontrado.")
+        return
             
     n_agents = len(agentes_nomes)
     if n_agents == 0: return
     
-    task = Prompt.ask("[bold #FFC857]Qual é a tarefa a ser resolvida pelos agentes?[/bold #FFC857]")
+    agentes_models = [llm] * n_agents
+    
+    if INQUIRER_AVAILABLE:
+        try:
+            same_model = await inquirer.confirm(
+                message="Deseja usar o mesmo modelo atual para TODOS os agentes?",
+                default=True,
+                qmark="◈"
+            ).execute_async()
+        except Exception:
+            same_model = True
+    else:
+        ans = Prompt.ask(f"[{C_WARNING}]Deseja usar o mesmo modelo atual para TODOS os agentes?[/{C_WARNING}]", choices=["s", "n"], default="s")
+        same_model = (ans == "s")
+
+    if not same_model:
+        for i, name in enumerate(agentes_nomes):
+            animated_separator(f"Modelo para o agente '{name}'")
+            chosen_m = await gerenciar_modelos(llm)
+            if chosen_m:
+                agentes_models[i] = chosen_m
+    
+    animated_separator("Tarefa")
+    task = Prompt.ask(f"[bold {C_WARNING}]Tarefa para a equipe[/bold {C_WARNING}]")
     if not task.strip(): return
     
     duckroom_proc = None
     if load_config("General", "duckroom") == "on":
         import subprocess
-        duck_script = os.path.join(BASE_DIR, "duck_room.py")
+        duck_script = os.path.join(BASE_DIR, "modules", "duck_room.py")
         try:
             duckroom_proc = subprocess.Popen(
                 [sys.executable, duck_script, "--agent-mode", "--ducks", str(n_agents)], 
@@ -1155,26 +1434,41 @@ async def run_multi_agents(llm, tools, workspace_dir, mcp_sessions, mcp_tools, a
                 text=True, 
                 encoding="utf-8"
             )
+            # Envia a tarefa para aparecer no balão central (UI) do Duck Room
+            try:
+                task_msg = json.dumps({"type": "task", "message": task})
+                duckroom_proc.stdin.write(task_msg + "\n")
+                duckroom_proc.stdin.flush()
+            except Exception as e:
+                pass
         except Exception as e:
-            console.print(f"[red]Erro ao iniciar Duck Room: {e}[/red]")
+            notify_error(f"Duck Room: {e}")
         
     from rich.layout import Layout
-    layout = Layout()
     
+    # Auto-scroll: show only the latest N lines per agent
+    terminal_height = console.size.height
+    max_visible_lines = max(15, terminal_height - 8)
+    
+    layout = Layout()
     layout.split_row(*[Layout(name=f"agent_{i}") for i in range(n_agents)])
     
     agent_texts = {i: "" for i in range(n_agents)}
     shared_history = [
-        {"role": "user", "content": f"TAREFA PRINCIPAL: {task}\n\nVocês são a seguinte equipe: {', '.join(agentes_nomes)}.\nTrabalhem juntos, discutindo e resolvendo a demanda do usuário. Usem as ferramentas MCP à disposição se precisarem interagir com arquivos.\n\nREGRAS DE COLABORAÇÃO:\n1. NÃO tomem decisões unilaterais fora da sua função. Cada agente tem um papel específico (ex: Product Owner cria/organiza demandas, Dev constrói/executa, QA analisa falhas, etc).\n2. Se você precisa que outro agente faça uma parte do trabalho, FAÇA A PASSAGEM DA TAREFA DE FORMA CLARA, citando o agente que deve assumir e passando o contexto necessário.\n\nIMPORTANTE: Quando a equipe concluir 100% da Tarefa Principal e todos concordarem que nada mais precisa ser feito (o código foi concluído, as validações e entregas feitas), qualquer agente pode simplesmente incluir a palavra-chave exata [TASK_COMPLETED] na sua resposta para encerrar este ciclo de colaboração."}
+        {"role": "user", "content": f"TAREFA PRINCIPAL: {task}\n\nVocês são a seguinte equipe: {', '.join(agentes_nomes)}.\nTrabalhem juntos, discutindo e resolvendo a demanda do usuário. Usem as ferramentas MCP à disposição se precisarem interagir com arquivos.\n\nREGRAS DE COLABORAÇÃO:\n1. NÃO tomem decisões unilaterais fora da sua função. Cada agente tem um papel específico (ex: Product Owner cria/organiza demandas, Dev constrói/executa, QA analisa falhas, etc).\n2. Se você precisa que outro agente faça uma parte do trabalho, FAÇA A PASSAGEM DA TAREFA DE FORMA CLARA, citando o agente que deve assumir e passando o contexto necessário.\n3. Sempre VALIDE seu trabalho antes de declarar conclusão. Dev deve testar, QA deve revisar, PO deve validar requisitos.\n4. Mantenham SINERGIA: cada agente deve complementar o trabalho dos outros, garantindo coesão na entrega final.\n\nIMPORTANTE: Quando a equipe concluir 100% da Tarefa Principal e todos concordarem que nada mais precisa ser feito (o código foi concluído, as validações e entregas feitas), qualquer agente pode simplesmente incluir a palavra-chave exata [TASK_COMPLETED] na sua resposta para encerrar este ciclo de colaboração."}
     ]
     
-    def get_layout():
+    def get_layout(round_num=0):
         for i, name in enumerate(agentes_nomes):
+            color = AGENT_COLORS[i % len(AGENT_COLORS)]
+            icon = AGENT_ICONS[i % len(AGENT_ICONS)]
             txt = agent_texts[i]
-            # Limitar tamanho de exibição para não quebrar UI vertical com histórico longo
+            
+            # AUTO-SCROLL: keep only the latest visible lines
             lines = txt.split("\n")
-            if len(lines) > 60:
-                txt = "...\n" + "\n".join(lines[-60:])
+            if len(lines) > max_visible_lines:
+                txt = f"[{C_DIM}]··· scroll ···[/{C_DIM}]\n" + "\n".join(lines[-max_visible_lines:])
+            
             try:
                 panel_text = Text.from_markup(txt)
             except Exception:
@@ -1185,9 +1479,11 @@ async def run_multi_agents(llm, tools, workspace_dir, mcp_sessions, mcp_tools, a
             
             panel = Panel(
                 panel_text,
-                title=f"[bold #45B7D1]🎭 {name}[/bold #45B7D1]",
-                border_style="#45B7D1",
-                expand=True
+                title=f"[bold {color}]{icon} {name}[/bold {color}]",
+                subtitle=f"[{C_DIM}]R{round_num + 1}[/{C_DIM}]",
+                border_style=color,
+                expand=True,
+                padding=(0, 1),
             )
             layout[f"agent_{i}"].update(panel)
         return layout
@@ -1202,7 +1498,7 @@ async def run_multi_agents(llm, tools, workspace_dir, mcp_sessions, mcp_tools, a
                 sys_prompt = f"{custom_base_sys}\n\n[Você é o '{name}' nesta rodada da equipe. Lembre-se, use [TASK_COMPLETED] se a missão de todos já estiver concluída e finalizada no projeto.]"
                 msgs = [{"role": "system", "content": sys_prompt}]
                 msgs.extend(shared_history)
-                streams.append(llm.create_chat_completion(messages=msgs, tools=tools, tool_choice="auto", max_tokens=2048, stream=True))
+                streams.append(agentes_models[i].create_chat_completion(messages=msgs, tools=tools, tool_choice="auto", max_tokens=2048, stream=True))
 
             async def consume_stream(i, generator):
                 message = {"role": "assistant", "content": "", "tool_calls": []}
@@ -1228,26 +1524,85 @@ async def run_multi_agents(llm, tools, workspace_dir, mcp_sessions, mcp_tools, a
                                 duckroom_proc.stdin.flush()
                             except Exception: pass
                             
-                        live.update(get_layout())
+                        live.update(get_layout(round_idx))
                         
                     if "tool_calls" in delta and delta["tool_calls"]:
                         for tc_chunk in delta["tool_calls"]:
-                            idx = tc_chunk.get("index", 0)
-                            while len(message["tool_calls"]) <= idx:
-                                message["tool_calls"].append({"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
+                            index = tc_chunk.get("index")
+                            if index is None:
+                                tc_id = tc_chunk.get("id")
+                                if tc_id:
+                                    found_idx = next((idx_search for idx_search, t in enumerate(message["tool_calls"]) if t.get("id") == tc_id), None)
+                                    if found_idx is not None:
+                                        index = found_idx
+                                    else:
+                                        index = len(message["tool_calls"])
+                                else:
+                                    index = max(0, len(message["tool_calls"]) - 1)
+                                    
+                            while len(message["tool_calls"]) <= index:
+                                message["tool_calls"].append({
+                                    "id": "", "type": "function", "function": {"name": "", "arguments": ""}
+                                })
                             
-                            tc_acc = message["tool_calls"][idx]
+                            tc_acc = message["tool_calls"][index]
                             for k, v in tc_chunk.items():
                                 if k == "index": continue
                                 if k == "function" and isinstance(v, dict):
                                     for fk, fv in v.items():
                                         if fv is not None:
-                                            tc_acc["function"][fk] = tc_acc["function"].get(fk, "") + str(fv)
+                                            if fk in ["name", "arguments"]:
+                                                tc_acc["function"][fk] = tc_acc["function"].get(fk, "") + str(fv)
+                                            else:
+                                                if isinstance(fv, str):
+                                                    tc_acc["function"][fk] = tc_acc["function"].get(fk, "") + fv
+                                                else:
+                                                    tc_acc["function"][fk] = fv
                                 elif v is not None:
-                                    if k == "type": tc_acc[k] = v
-                                    elif k == "id": tc_acc[k] = tc_acc.get(k, "") + str(v)
-                                    else: tc_acc[k] = tc_acc.get(k, "") + str(v)
-                                    
+                                    if k == "type":
+                                        tc_acc[k] = v
+                                    elif k == "id":
+                                        tc_acc[k] = tc_acc.get(k, "") + str(v)
+                                    else:
+                                        if isinstance(v, str):
+                                            tc_acc[k] = tc_acc.get(k, "") + v
+                                        else:
+                                            tc_acc[k] = v
+                            
+                            # Accumulate extra_content for Gemini
+                            if "extra_content" in tc_chunk and tc_chunk["extra_content"]:
+                                if "extra_content" not in tc_acc or not isinstance(tc_acc["extra_content"], dict): 
+                                    tc_acc["extra_content"] = {}
+                                if isinstance(tc_chunk["extra_content"], dict):
+                                    tc_acc["extra_content"].update(tc_chunk["extra_content"])
+                        
+                    # Accumulate top-level extra_content for Gemini
+                    if "extra_content" in delta and delta["extra_content"]:
+                        if "extra_content" not in message or not isinstance(message["extra_content"], dict): 
+                            message["extra_content"] = {}
+                        if isinstance(delta["extra_content"], dict):
+                            message["extra_content"].update(delta["extra_content"])
+                            
+                # --- FALLBACK: PARSER MANUAL DE TOOL CALL ---
+                if not message.get("tool_calls") and "<tool_call>" in message.get("content", ""):
+                    if "tool_calls" not in message: message["tool_calls"] = []
+                    matches = re.findall(r'<tool_call>(.*?)</tool_call>', message["content"], re.DOTALL | re.IGNORECASE)
+                    for match_idx, match in enumerate(matches):
+                        clean_match = match.strip()
+                        if clean_match.startswith('```json'): clean_match = clean_match[7:]
+                        elif clean_match.startswith('```'): clean_match = clean_match[3:]
+                        if clean_match.endswith('```'): clean_match = clean_match[:-3]
+                        try:
+                            tool_data = json.loads(clean_match.strip())
+                            if "name" in tool_data and "arguments" in tool_data:
+                                message["tool_calls"].append({
+                                    "id": f"call_manual_m_{match_idx}",
+                                    "type": "function",
+                                    "function": {"name": tool_data["name"], "arguments": json.dumps(tool_data["arguments"])}
+                                })
+                        except json.JSONDecodeError:
+                            pass
+
                 if message.get("tool_calls"):
                     for idx_tc, tc in enumerate(message["tool_calls"]):
                         if not tc.get("id"):
@@ -1265,7 +1620,7 @@ async def run_multi_agents(llm, tools, workspace_dir, mcp_sessions, mcp_tools, a
             # Sincroniza e Processa ferramentas (execução sequencial no final do round de cada agente)
             for i, name in enumerate(agentes_nomes):
                 res = results[i]
-                agent_texts[i] += f"\n\n[dim]--- Fim da fala do {name} na rodada {round_idx+1} ---[/dim]\n"
+                agent_texts[i] += f"\n\n[{C_DIM}]─── {name} · R{round_idx+1} ───[/{C_DIM}]\n"
                 
                 ast_msg = {"role": "assistant"}
                 
@@ -1278,6 +1633,9 @@ async def run_multi_agents(llm, tools, workspace_dir, mcp_sessions, mcp_tools, a
                 if res.get("tool_calls"):
                     ast_msg["tool_calls"] = res["tool_calls"]
                     
+                if "extra_content" in res:
+                    ast_msg["extra_content"] = res["extra_content"]
+                    
                 if ast_msg.get("content") or ast_msg.get("tool_calls"):
                     shared_history.append(ast_msg)
                 
@@ -1286,26 +1644,25 @@ async def run_multi_agents(llm, tools, workspace_dir, mcp_sessions, mcp_tools, a
                         tname = tc.get("function", {}).get("name")
                         try:
                             targs = json.loads(tc.get("function", {}).get("arguments", "{}"))
-                            agent_texts[i] += f"\n[bold #FF8E53]⚙ Executando {tname}...[/bold #FF8E53]"
-                            live.update(get_layout())
+                            agent_texts[i] += f"\n[bold {C_TOOL}]▸ {tname}[/bold {C_TOOL}]"
+                            live.update(get_layout(round_idx))
                             
                             target_srv = mcp_tools.get(tname)
                             if target_srv and target_srv in mcp_sessions:
                                 sess = mcp_sessions[target_srv]
                                 tool_res = await sess.call_tool(tname, targs)
                                 t_out = "\n".join([c.text for c in tool_res.content if c.type == "text"])
-                                agent_texts[i] += f"\n[green]✓ {tname} concluído[/green]\n"
+                                agent_texts[i] += f"\n[{C_SUCCESS}]✓ {tname}[/{C_SUCCESS}]\n"
                                 shared_history.append({"role": "tool", "name": tname, "content": f"Resultado de {tname}:\n{t_out}", "tool_call_id": tc.get("id")})
                             else:
-                                agent_texts[i] += f"\n[red]✗ {tname}: MCP inativo[/red]\n"
+                                agent_texts[i] += f"\n[{C_ERROR}]✗ {tname}: MCP inativo[/{C_ERROR}]\n"
                                 shared_history.append({"role": "tool", "name": tname, "content": f"Erro: MCP inativo", "tool_call_id": tc.get("id")})
                         except Exception as e:
-                            agent_texts[i] += f"\n[red]✗ Erro no {tname}: {e}[/red]\n"
+                            agent_texts[i] += f"\n[{C_ERROR}]✗ {tname}: {e}[/{C_ERROR}]\n"
                             shared_history.append({"role": "tool", "name": tname, "content": f"Erro de processamento: {e}", "tool_call_id": tc.get("id")})
                             
-            live.update(get_layout())
+            live.update(get_layout(round_idx))
             
-            # Verifica se algum dos agentes declarou fim da tarefa
             task_completed = any("[TASK_COMPLETED]" in res.get("content", "") for res in results)
             if task_completed:
                 break
@@ -1315,10 +1672,9 @@ async def run_multi_agents(llm, tools, workspace_dir, mcp_sessions, mcp_tools, a
     if duckroom_proc and duckroom_proc.poll() is None:
         duckroom_proc.terminate()
         
-    console.print("\n[bold green]✅ Modo Multi-Agent Concluído e Tarefa Finalizada de forma autônoma pelos Agentes![/bold green]")
+    notify_success(f"Multi-Agent concluído • {round_idx + 1} rodada(s) • {n_agents} agentes")
 
 async def run_chat_loop():
-    # Animação de startup
     animated_startup()
     console.print(banner())
     
@@ -1326,17 +1682,17 @@ async def run_chat_loop():
         default_ws = os.getcwd()
         last_ws = load_config("General", "workspace")
 
-        animated_separator("Configuração do Workspace", "#FFC857")
+        animated_separator("Workspace")
         
         if last_ws and os.path.exists(last_ws):
-            use_last = Prompt.ask(f"[bold #FFC857]📂 Usar último workspace[/bold #FFC857] [dim]'{last_ws}'[/dim]", choices=["s", "n"], default="s")
+            use_last = Prompt.ask(f"[bold {C_WARNING}]Usar último workspace[/bold {C_WARNING}] [{C_DIM}]'{last_ws}'[/{C_DIM}]", choices=["s", "n"], default="s")
             if use_last == "s":
                 workspace_dir = last_ws
             else:
-                user_ws = Prompt.ask(f"[bold #FFC857]📂 Caminho do projeto[/bold #FFC857]", default=default_ws).strip('"')
+                user_ws = Prompt.ask(f"[bold {C_WARNING}]Caminho do projeto[/bold {C_WARNING}]", default=default_ws).strip('"')
                 workspace_dir = user_ws or default_ws
         else:
-            user_ws = Prompt.ask(f"[bold #FFC857]📂 Caminho do projeto[/bold #FFC857]", default=default_ws).strip('"')
+            user_ws = Prompt.ask(f"[bold {C_WARNING}]Caminho do projeto[/bold {C_WARNING}]", default=default_ws).strip('"')
             workspace_dir = user_ws or default_ws
         
         save_config("General", "workspace", workspace_dir)
@@ -1351,7 +1707,6 @@ async def run_chat_loop():
     with open(MCP_CONFIG_PATH, "r", encoding="utf-8") as f:
         mcp_config = json.load(f)
 
-    # Config ducktools workspace se ele existir e for stdio
     if "ducktools" in mcp_config.get("mcpServers", {}):
         mcp_config["mcpServers"]["ducktools"].setdefault("env", {})["WORKSPACE_DIR"] = workspace_dir
         with open(MCP_CONFIG_PATH, "w", encoding="utf-8") as f:
@@ -1359,25 +1714,23 @@ async def run_chat_loop():
 
     import contextlib
 
-    # Inicia a conexão com os servidores MCP
     async with contextlib.AsyncExitStack() as stack:
         mcp_sessions = {}
         mcp_tools = {}
         llama_tools = []
 
-        animated_separator("Conexão MCP", "#45B7D1")
+        animated_separator("MCP Protocol")
         
-        # 1. Animação de conexão com pato
-        with Live(console=console, refresh_per_second=12) as live:
+        with Live(console=console, refresh_per_second=20) as live:
             for i in range(12):
-                frame = DUCK_FRAMES[i % len(DUCK_FRAMES)]
+                spinner = SPINNER_FRAMES[i % len(SPINNER_FRAMES)]
                 msg = Text()
-                msg.append(f"  {frame} ", style="yellow")
-                msg.append("Conectando aos Servidores MCP...", style="bold #45B7D1")
+                msg.append(f"  {spinner} ", style=f"bold {C_PRIMARY}")
+                msg.append("Conectando aos servidores MCP...", style=C_TEXT)
                 live.update(msg)
-                await asyncio.sleep(0.08)
+                await asyncio.sleep(0.06)
         
-        with Status("[bold #45B7D1]🔌 Inicializando protocolo MCP...[/bold #45B7D1]", console=console, spinner="dots12"):
+        with Status(f"[bold {C_PRIMARY}]Inicializando protocolo MCP...[/bold {C_PRIMARY}]", console=console, spinner="dots12"):
             for srv_name, srv_cfg in mcp_config.get("mcpServers", {}).items():
                 if srv_cfg.get("disabled", False):
                     continue
@@ -1418,10 +1771,9 @@ async def run_chat_loop():
                     notify_error(f"Erro em {srv_name}: {e}")
 
         n_tools = len(llama_tools)
-        notify_success(f"MCP(s) conectado(s)! {n_tools} ferramentas disponíveis nas sessões ativas.")
+        notify_success(f"MCP conectado · {n_tools} ferramentas disponíveis")
 
-        # 2. CONFIGURAÇÃO DE PROMPTS
-        animated_separator("Carregando Configurações", "#A55EEA")
+        animated_separator("Configurações")
         saved_agent = autoload_agent()
         agent_prompt_text = saved_agent if saved_agent else SYSTEM_PROMPT
         
@@ -1430,39 +1782,36 @@ async def run_chat_loop():
         messages = [{"role": "system", "content": compor_prompt_sistema(agent_prompt_text, skills_prompts)}]
         llm = None 
 
-        # 3. CARREGAMENTO DO MODELO
         llm = await autoload_model()
         if not llm:
-            animated_separator("Seleção de Modelo", "#FF8E53")
+            animated_separator("Modelo")
             llm = await gerenciar_modelos(llm)
 
-        # Menu de comandos estilizado
         console.print()
         menu_table = Table(box=None, show_header=False, padding=(0, 2))
-        menu_table.add_column(style="bold #FFC857")
-        menu_table.add_column(style="white")
-        menu_table.add_row("🤖 /models", "Gerenciar modelos de IA")
-        menu_table.add_row("🎭 /multi", "Iniciar o modo multi-agentes simultâneos")
-        menu_table.add_row("🎯 /agents", "Carregar agente personalizado")
-        menu_table.add_row("⚡ /skills", "Carregar skills (ferramentas)")
-        menu_table.add_row("🔌 /mcp", "Gerenciar Servidores MCP")
-        menu_table.add_row("🌐 /server", "Iniciar servidor de API do DuckHunt")
-        menu_table.add_row("🧹 /skills clear", "Limpar todas as skills")
-        menu_table.add_row("🔄 /new", "Reiniciar conversa")
-        menu_table.add_row("↩️  /undo", "Desfazer alterações da última ação do modelo")
-        menu_table.add_row("🦆 /duckroom", "Alternar janela do Duck Room (ex: /duckroom on|off)")
-        menu_table.add_row("❓ /help", "Exibir esta lista de comandos")
-        menu_table.add_row("👋 /sair", "Encerrar aplicação")
+        menu_table.add_column(style=f"bold {C_PRIMARY}")
+        menu_table.add_column(style=C_TEXT)
+        menu_table.add_row("⬡ /models",       "Gerenciar modelos de IA")
+        menu_table.add_row("⬡ /multi",        "Modo multi-agentes colaborativo")
+        menu_table.add_row("⬡ /agents",       "Carregar agente personalizado")
+        menu_table.add_row("⬡ /skills",       "Gerenciar skills")
+        menu_table.add_row("⬡ /mcp",          "Gerenciar Servidores MCP")
+        menu_table.add_row("⬡ /server",       "Iniciar servidor de API")
+        menu_table.add_row("⬡ /workspace",    "Alterar diretório do projeto")
+        menu_table.add_row("⬡ /duckroom",     "Duck Room (on/off)")
+        menu_table.add_row("↻ /new",          "Reiniciar conversa")
+        menu_table.add_row("↩ /undo",         "Desfazer última ação do modelo")
+        menu_table.add_row("? /help",         "Lista de comandos")
+        menu_table.add_row("✗ /sair",         "Encerrar")
 
         console.print(Panel(
             menu_table,
-            title="[bold #4ECB71]⌨  Comandos Disponíveis[/bold #4ECB71]",
-            border_style="#4ECB71",
+            title=f"[bold {C_ACCENT}]Comandos[/bold {C_ACCENT}]",
+            border_style=C_BORDER,
             expand=False,
             padding=(1, 2),
         ))
         
-        # Barra de status da sessão
         model_name = llm.model_name if llm else None
         agent_file = load_config("Agent", "filename")
         status_bar(model_name, agent_file, skills_prompts if skills_prompts else None)
@@ -1473,34 +1822,28 @@ async def run_chat_loop():
                 console.print()
                 animated_separator(style="dim")
                 
-                # Prompt estilizado com timestamp
                 from datetime import datetime
                 ts = datetime.now().strftime("%H:%M")
-                user_input = Prompt.ask(f"[dim]{ts}[/dim] [bold #45B7D1]Você[/bold #45B7D1] [bold #4ECB71]›[/bold #4ECB71]")
+                user_input = Prompt.ask(f"[{C_DIM}]{ts}[/{C_DIM}] [bold {C_PRIMARY}]Você[/bold {C_PRIMARY}] [bold {C_ACCENT}]›[/bold {C_ACCENT}]")
                 cmd = user_input.strip().lower()
                 
                 if cmd in ['/sair', '/exit', '/quit', 'sair', 'exit', 'quit']:
-                    # Animação de despedida
                     console.print()
-                    farewell = gradient_text("🦆 Até a próxima caçada! Encerrando DuckHunt... 🦆")
+                    farewell = gradient_text("◈ Encerrando DuckHunt — Até logo!")
                     console.print(Align.center(farewell))
                     console.print()
                     break
                 if cmd == '/server':
-                    console.print()
-                    msg = gradient_text("🌐 Preparando o modo Servidor API... 🌐")
-                    console.print(Align.center(msg))
-                    console.print()
                     return "START_SERVER"
                 if cmd in ['/models', '/model', '/modelo']:
-                    animated_separator("Seleção de Modelo", "#FF8E53")
+                    animated_separator("Modelo")
                     llm = await gerenciar_modelos(llm)
                     model_name = llm.model_name if llm else None
                     status_bar(model_name, load_config("Agent", "filename"), skills_prompts if skills_prompts else None)
                     continue
                 if cmd in ['/agents', '/agent', '/agente']:
-                    animated_separator("Seleção de Agente", "#A55EEA")
-                    novo_prompt = gerenciar_agentes(agent_prompt_text)
+                    animated_separator("Agente")
+                    novo_prompt = await gerenciar_agentes(agent_prompt_text)
                     if novo_prompt != agent_prompt_text:
                         agent_prompt_text = novo_prompt
                         messages = [{"role": "system", "content": compor_prompt_sistema(agent_prompt_text, skills_prompts)}]
@@ -1509,31 +1852,29 @@ async def run_chat_loop():
                 if cmd == '/mcp':
                     gerenciar_mcp()
                     continue
-                if cmd in ['/skills clear', '/skill clear', '/skillsclear', '/skillclear']:
-                    skills_prompts = []
-                    messages = [{"role": "system", "content": compor_prompt_sistema(agent_prompt_text, skills_prompts)}]
-                    notify_info("Skills removidas. Contexto reiniciado.")
-                    continue
-                
-                if cmd in ['/multi']:
-                    await run_multi_agents(llm, llama_tools, workspace_dir, mcp_sessions, mcp_tools, agent_prompt_text, skills_prompts)
-                    continue
-
-                if cmd in ['/skills', '/skill', '/skill']:
-                    animated_separator("Skills", "#FFC857")
-                    novas = gerenciar_skills()
-                    if novas:
+                if cmd in ['/skills', '/skill']:
+                    animated_separator("Skills")
+                    resultado = await gerenciar_skills(current_skills=skills_prompts)
+                    if resultado == "CLEAR":
+                        skills_prompts = []
+                        messages = [{"role": "system", "content": compor_prompt_sistema(agent_prompt_text, skills_prompts)}]
+                        notify_info("Skills removidas. Contexto reiniciado.")
+                    elif resultado:
                         existentes = {s.get("name") for s in skills_prompts}
-                        for sk in novas:
+                        for sk in resultado:
                             if sk.get("name") not in existentes:
                                 skills_prompts.append(sk)
                         messages = [{"role": "system", "content": compor_prompt_sistema(agent_prompt_text, skills_prompts)}]
                         notify_success("Contexto atualizado com novas skills.")
                     continue
                 
+                if cmd in ['/multi']:
+                    await run_multi_agents(llm, llama_tools, workspace_dir, mcp_sessions, mcp_tools, agent_prompt_text, skills_prompts)
+                    continue
+                
                 if cmd == '/new':
                     messages = [{"role": "system", "content": compor_prompt_sistema(agent_prompt_text, skills_prompts)}]
-                    notify_info("🔄 Chat reiniciado. Nova conversa iniciada.")
+                    notify_info("Chat reiniciado.")
                     continue
                 
                 if cmd in ['/duckroom on', '/duckroom off']:
@@ -1553,11 +1894,27 @@ async def run_chat_loop():
                         notify_error(msg_status)
                     continue
                 
+                if cmd == '/workspace':
+                    novo_ws = Prompt.ask(f"[bold {C_WARNING}]Novo caminho do projeto[/bold {C_WARNING}]", default=workspace_dir).strip('"')
+                    if novo_ws and os.path.exists(novo_ws):
+                        workspace_dir = novo_ws
+                        save_config("General", "workspace", workspace_dir)
+                        notify_success(f"Workspace alterado para: {workspace_dir}")
+                        
+                        if "ducktools" in mcp_config.get("mcpServers", {}):
+                            mcp_config["mcpServers"]["ducktools"].setdefault("env", {})["WORKSPACE_DIR"] = workspace_dir
+                            with open(MCP_CONFIG_PATH, "w", encoding="utf-8") as f:
+                                json.dump(mcp_config, f, ensure_ascii=False, indent=2)
+                            notify_info("A mudança no ducktools terá efeito no próximo reinício da aplicação.")
+                    elif novo_ws:
+                        notify_error(f"Diretório '{novo_ws}' não encontrado.")
+                    continue
+                
                 if cmd == '/help':
                     console.print(Panel(
                         menu_table,
-                        title="[bold #4ECB71]⌨  Comandos Disponíveis[/bold #4ECB71]",
-                        border_style="#4ECB71",
+                        title=f"[bold {C_ACCENT}]Comandos[/bold {C_ACCENT}]",
+                        border_style=C_BORDER,
                         expand=False,
                         padding=(1, 2),
                     ))
@@ -1593,8 +1950,28 @@ async def run_chat_loop():
 
                 # LOOP DE RACIOCÍNIO E FERRAMENTAS
                 while True:
+                    # Built-in tools para o AI
+                    ai_tools = list(llama_tools)
+                    ai_tools.append({
+                        "type": "function",
+                        "function": {
+                            "name": "load_duckhunt_skill",
+                            "description": "Loads a specific DuckHunt skill into your current context. Call this when the user needs specialized knowledge or integrations (e.g., payment gateways) that are listed in your AVAILABLE SKILLS.",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {
+                                    "skill_name": {
+                                        "type": "string",
+                                        "description": "The exact name of the skill to load (e.g. 'abacate-pay')"
+                                    }
+                                },
+                                "required": ["skill_name"]
+                            }
+                        }
+                    })
+                    
                     # Executa a geração em uma thread para não bloquear o Asyncio
-                    message = await asyncio.to_thread(stream_and_accumulate, llm, messages, llama_tools)
+                    message = await asyncio.to_thread(stream_and_accumulate, llm, messages, ai_tools)
                     messages.append(message) 
                     
                     if "tool_calls" not in message:
@@ -1605,27 +1982,41 @@ async def run_chat_loop():
                         tool_name = tool_call["function"]["name"]
                         tool_args = json.loads(tool_call["function"]["arguments"])
                         
-                        # Painel de execução da ferramenta
                         tool_display = Text()
-                        tool_display.append("⚙ - ", style="bold #FF8E53")
-                        tool_display.append(tool_name, style="bold #FFC857")
-                        tool_display.append(f"\n{json.dumps(tool_args, indent=2, ensure_ascii=False)[:200]}", style="dim")
+                        tool_display.append("▸ ", style=f"bold {C_TOOL}")
+                        tool_display.append(tool_name, style=f"bold {C_WARNING}")
+                        tool_display.append(f"\n{json.dumps(tool_args, indent=2, ensure_ascii=False)[:300]}", style=C_DIM)
                         console.print(Panel(
                             tool_display,
-                            title="[bold #FF8E53]Executando Ferramenta[/bold #FF8E53]",
-                            border_style="#FF8E53",
+                            title=f"[bold {C_TOOL}]Tool Execution[/bold {C_TOOL}]",
+                            border_style=C_TOOL,
                             expand=False,
                             padding=(0, 1),
                         ))
                         
-                        # Animação de pato durante execução da ferramenta
-                        with Live(console=console, refresh_per_second=10) as live:
+                        # Animação de processamento
+                        with Live(console=console, refresh_per_second=12) as live:
                             task_done = False
                             frame_idx = 0
                             
                             async def run_tool():
                                 nonlocal task_done
                                 try:
+                                    if tool_name == "load_duckhunt_skill":
+                                        req_skill = tool_args.get("skill_name")
+                                        if not req_skill:
+                                            return "Error: skill_name not provided."
+                                        if any(s.get("name") == req_skill for s in skills_prompts):
+                                            return f"Skill '{req_skill}' is already loaded in your context."
+                                            
+                                        sucesso = load_skill_by_name(req_skill, skills_prompts)
+                                        if sucesso:
+                                            messages[0]["content"] = compor_prompt_sistema(agent_prompt_text, skills_prompts)
+                                            notify_success(f"Skill '{req_skill}' ativada dinamicamente pelo modelo.")
+                                            return f"Success: Skill '{req_skill}' has been loaded. Its instructions are now available in your system prompt."
+                                        else:
+                                            return f"Error: Skill '{req_skill}' not found or failed to load."
+                                            
                                     target_srv = mcp_tools.get(tool_name)
                                     if not target_srv or target_srv not in mcp_sessions:
                                         return f"Erro: Servidor MCP para a ferramenta '{tool_name}' não encontrado."
@@ -1640,20 +2031,20 @@ async def run_chat_loop():
                             tool_task = asyncio.create_task(run_tool())
                             
                             while not task_done:
-                                frame = DUCK_FRAMES[frame_idx % len(DUCK_FRAMES)]
+                                spinner = SPINNER_FRAMES[frame_idx % len(SPINNER_FRAMES)]
                                 anim_text = Text()
-                                anim_text.append(f"  {frame} ", style="yellow")
-                                anim_text.append("Processando...", style="dim italic")
+                                anim_text.append(f"  {spinner} ", style=f"bold {C_PRIMARY}")
+                                anim_text.append("Processando...", style=f"{C_DIM} italic")
                                 live.update(anim_text)
                                 frame_idx += 1
-                                await asyncio.sleep(0.1)
+                                await asyncio.sleep(0.08)
                             
                             tool_result_text = await tool_task
                         
                         if tool_result_text.startswith("Erro:"):
                             notify_error(tool_result_text)
                         else:
-                            console.print(f"  [bold #4ECB71]✓[/bold #4ECB71] [dim]Ferramenta concluída[/dim]")
+                            console.print(f"  [bold {C_SUCCESS}]✓[/bold {C_SUCCESS}] [{C_DIM}]Concluído[/{C_DIM}]")
 
                         messages.append({"role": "tool", "name": tool_name, "content": tool_result_text, "tool_call_id": tool_call["id"]})
 
@@ -1670,7 +2061,7 @@ if __name__ == "__main__":
             start_server = True
     except KeyboardInterrupt:
         console.print()
-        farewell = gradient_text("🦆 Encerrando DuckHunt... Até logo! 🦆")
+        farewell = gradient_text("◈ Encerrando DuckHunt — Até logo!")
         console.print(Align.center(farewell))
         console.print()
     except asyncio.CancelledError:

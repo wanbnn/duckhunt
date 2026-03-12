@@ -6,7 +6,7 @@
         "mcp/ducktools/server.py"
       ],
       "env": {
-        "WORKSPACE_DIR": ""
+        "WORKSPACE_DIR": "C:\\Users\\jose.wcavalcante\\Documents\\example"
       }
     },
     "sqlserver": {
