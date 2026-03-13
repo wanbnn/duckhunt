@@ -6,7 +6,7 @@
         "mcp/ducktools/server.py"
       ],
       "env": {
-        "WORKSPACE_DIR": "C:\\Users\\jose.wcavalcante\\Documents\\GitHub\\JourneyCX"
+        "WORKSPACE_DIR": ""
       }
     },
     "duck_sqlite": {
@@ -15,7 +15,7 @@
         "mcp/duck_sqlite/server.py"
       ],
       "env": {
-        "WORKSPACE_DIR": "C:\\Users\\jose.wcavalcante\\Documents\\example"
+        "WORKSPACE_DIR": ""
       }
     },
     "sqlserver": {
