@@ -172,7 +172,7 @@ def status_bar(model_name=None, agent_name=None, skills_list=None):
 # Configurações de Diretório
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODELS_DIR = os.path.join(BASE_DIR, "models")
-MCP_CONFIG_PATH = os.path.join("mcp", "config.json")
+MCP_CONFIG_PATH = os.path.join(BASE_DIR, "mcp", "config.json")
 AGENTS_DIR = os.path.join(BASE_DIR, "agents")
 SKILLS_DIR = os.path.join(BASE_DIR, "skills")
 CONFIG_FILE = os.path.join(BASE_DIR, "config.ini")
@@ -237,7 +237,11 @@ You have **tools (Tools / Function Calling)** to interact with the system.
 ### ABSOLUTE RULES
 
 1. To perform actions (**create/edit files, read directories, run commands**), you **MUST use the provided tools**.
-2. **Tool Format:** If the native call fails, you **MUST write the action using the format below:**
+2. **Terminal Usage:** When executing commands via `execute_command`:
+   - On **Windows**, the system uses **PowerShell**.
+   - On **Linux/macOS**, the system uses **Bash**.
+   - Always assume you are at the root of the **Workspace Directory** provided in your context.
+3. **Tool Format:** If the native call fails, you **MUST write the action using the format below:**
 
 ```
 <tool_call>
@@ -357,11 +361,43 @@ class UnifiedLLM:
                 console.print(f"[red]Erro API Anthropic: {e}[/red]")
             return
 
+        # --- PREPARAÇÃO SEGURA DE MENSAGENS (FIX GEMINI THOUGHT SIGNATURE) ---
+        clean_messages = []
+        gemini_messages = []
+        
+        for m in messages:
+            # Copia da mensagem removendo campos extras para validação Pydantic do SDK OpenAI
+            clean_m = {k: v for k, v in m.items() if k != "extra_content"}
+            if clean_m.get("tool_calls"):
+                clean_m["tool_calls"] = [
+                    {k: v for k, v in tc.items() if k != "extra_content"} 
+                    for tc in clean_m["tool_calls"]
+                ]
+            clean_messages.append(clean_m)
+            
+            if self.model_type == "gemini":
+                # Mantém a mensagem com atributos originais intactos para injetar via extra_body
+                gemini_m = {k: v for k, v in m.items()}
+                if gemini_m.get("tool_calls"):
+                    gemini_m["tool_calls"] = [tc.copy() for tc in gemini_m["tool_calls"]]
+                gemini_messages.append(gemini_m)
+
+        if self.model_type == "gemini":
+            # O Gemini exige thought_signature no histórico de tool_calls para funcionar corretamente.
+            # Copiamos o thought_signature do primeiro tool_call para os demais.
+            for m in gemini_messages:
+                if m.get("role") == "assistant" and m.get("tool_calls"):
+                    ext = next((tc.get("extra_content") for tc in m["tool_calls"] if tc.get("extra_content")), None)
+                    if ext:
+                        for tc in m["tool_calls"]:
+                            tc["extra_content"] = ext
+
         kwargs = {
-            "messages": messages,
+            "messages": clean_messages,
             "stream": stream,
             "model": self.model_name
         }
+        
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = tool_choice
@@ -369,6 +405,10 @@ class UnifiedLLM:
         if self.model_type in ("openai", "gemini"):
             if max_tokens: kwargs["max_tokens"] = max_tokens
             if temperature: kwargs["temperature"] = temperature
+            
+        if self.model_type == "gemini":
+            # Injeta as mensagens ricas, bypassando a validação Pydantic do SDK
+            kwargs["extra_body"] = {"messages": gemini_messages}
         
         # Azure ignora max_tokens e temperature
 
@@ -385,47 +425,41 @@ class UnifiedLLM:
             console.print(f"[red]Erro API ({self.model_type}): {e}[/red]")
 
     def _convert_chunk(self, chunk):
-        if not hasattr(chunk, "choices") or not chunk.choices: return {}
-        choice = chunk.choices[0]
-        delta = choice.delta
-        delta_dict = {}
-        if hasattr(delta, "content") and delta.content is not None: 
-            delta_dict["content"] = delta.content
-            
-        # Preserve Gemini thought signatures (extra_content) in assistant messages
-        # This is REQUIRED for Gemini tools to work in follow-up calls
-        if hasattr(delta, "extra_content") and delta.extra_content:
-            # Ensure extra_content is a dictionary if we intend to update it
-            if isinstance(delta.extra_content, dict):
-                delta_dict.setdefault("extra_content", {}).update(delta.extra_content)
-            else:
-                delta_dict["extra_content"] = delta.extra_content
+        if hasattr(chunk, "model_dump"):
+            chunk_dict = chunk.model_dump(exclude_unset=True)
+        elif hasattr(chunk, "dict"):
+            chunk_dict = chunk.dict(exclude_unset=True)
+        else:
+            chunk_dict = chunk if isinstance(chunk, dict) else vars(chunk)
 
-        if getattr(delta, "tool_calls", None):
-            # Initialize tool_calls list if it doesn't exist in delta_dict
-            if "tool_calls" not in delta_dict:
-                delta_dict["tool_calls"] = []
-            for tc in delta.tool_calls:
-                if hasattr(tc, "model_dump"):
-                    tc_dict = tc.model_dump(exclude_unset=True)
+        choices = chunk_dict.get("choices", [])
+        if not choices: return {}
+        
+        choice = choices[0]
+        delta_dict = choice.get("delta", {})
+        
+        # O model_dump() do Pydantic já inclui automaticamente todos os campos extras
+        if hasattr(chunk, "choices") and chunk.choices:
+            raw_delta = chunk.choices[0].delta
+            if hasattr(raw_delta, "extra_content") and getattr(raw_delta, "extra_content", None):
+                if isinstance(raw_delta.extra_content, dict):
+                    delta_dict.setdefault("extra_content", {}).update(raw_delta.extra_content)
                 else:
-                    tc_dict = {"index": getattr(tc, "index", None)}
-                    if getattr(tc, "id", None): tc_dict["id"] = tc.id
-                    if getattr(tc, "type", None): tc_dict["type"] = tc.type
-                    if getattr(tc, "function", None):
-                        tc_dict["function"] = {}
-                        if getattr(tc.function, "name", None): tc_dict["function"]["name"] = tc.function.name
-                        if getattr(tc.function, "arguments", None): tc_dict["function"]["arguments"] = tc.function.arguments
-                    # Preserve extra_content inside individual tool calls if present
-                    ext = getattr(tc, "extra_content", None)
-                    if ext:
-                        # Ensure extra_content is a dictionary if we intend to update it
-                        if isinstance(ext, dict):
-                            tc_dict.setdefault("extra_content", {}).update(ext)
-                        else:
-                            tc_dict["extra_content"] = ext
-                delta_dict["tool_calls"].append(tc_dict)
-        return {"choices": [{"delta": delta_dict, "finish_reason": choice.finish_reason}]}
+                    delta_dict["extra_content"] = raw_delta.extra_content
+                    
+            raw_tcs = getattr(raw_delta, "tool_calls", None)
+            if raw_tcs and "tool_calls" in delta_dict:
+                for i, raw_tc in enumerate(raw_tcs):
+                    if i < len(delta_dict["tool_calls"]):
+                        tc_dict = delta_dict["tool_calls"][i]
+                        ext = getattr(raw_tc, "extra_content", None)
+                        if ext:
+                            if isinstance(ext, dict):
+                                tc_dict.setdefault("extra_content", {}).update(ext)
+                            else:
+                                tc_dict["extra_content"] = ext
+
+        return {"choices": [{"delta": delta_dict, "finish_reason": choice.get("finish_reason")}]}
 
 async def gerenciar_agentes(current_prompt: str) -> str:
     try:
@@ -639,6 +673,17 @@ def load_skill_by_name(skill_name: str, skills_prompts: list) -> bool:
 
 def compor_prompt_sistema(agent_prompt_text: str, skills_prompts: list) -> str:
     partes = [agent_prompt_text or ""]
+    
+    # Inject essential rules that might be missing in custom agent prompts
+    essential_rules = """
+
+### SYSTEM CAPABILITIES & RULES
+1. You have tools available to perform actions (read/write files, run commands, etc.). You MUST use these tools to execute your tasks. NEVER ask the user to copy/paste code into files. ALWAYS use the tools to create or edit files yourself.
+2. If multiple MCP servers provide tools with similar names, the system may have prefixed them (e.g., ducktools_create_file). ALWAYS use the exact tool name provided in your tools schema.
+3. Call the tool, wait for the result, and if additional context is needed, read the file first before proceeding.
+"""
+    if "### ABSOLUTE RULES" not in partes[0] and "SYSTEM CAPABILITIES & RULES" not in partes[0]:
+        partes.append(essential_rules)
     
     if skills_prompts:
         partes.append("\n\n### ACTIVE SKILLS (EXTENSIONS)\n")
@@ -1695,11 +1740,23 @@ async def run_chat_loop():
         else:
             user_ws = Prompt.ask(f"[bold {C_WARNING}]Caminho do projeto[/bold {C_WARNING}]", default=default_ws).strip('"')
             workspace_dir = user_ws or default_ws
+            
+        workspace_dir = os.path.abspath(workspace_dir)
         
         save_config("General", "workspace", workspace_dir)
+        
+        try:
+            os.chdir(workspace_dir)
+        except Exception as e:
+            notify_error(f"Erro ao acessar {workspace_dir}: {e}")
+            
         notify_success(f"Workspace: {workspace_dir}")
     except Exception:
         workspace_dir = os.getcwd()
+        try:
+            os.chdir(workspace_dir)
+        except:
+            pass
 
     if not os.path.exists(MCP_CONFIG_PATH):
         notify_error(f"{MCP_CONFIG_PATH} não encontrado.")
@@ -1744,8 +1801,16 @@ async def run_chat_loop():
                     if typ == "stdio":
                         cmd = srv_cfg.get("command", "python")
                         if cmd in ("python", "python.exe", "python3"): cmd = sys.executable
+                        
+                        args = []
+                        for arg in srv_cfg.get("args", []):
+                            if arg.startswith("mcp/") or arg.startswith("mcp\\"):
+                                args.append(os.path.join(BASE_DIR, arg))
+                            else:
+                                args.append(arg)
+                                
                         env = {**os.environ, **srv_cfg.get("env", {})}
-                        params = StdioServerParameters(command=cmd, args=srv_cfg.get("args", []), env=env)
+                        params = StdioServerParameters(command=cmd, args=args, env=env)
                         read, write = await stack.enter_async_context(stdio_client(params))
                     elif typ in ("http", "sse"):
                         try:
@@ -1903,9 +1968,15 @@ async def run_chat_loop():
                 
                 if cmd == '/workspace':
                     novo_ws = Prompt.ask(f"[bold {C_WARNING}]Novo caminho do projeto[/bold {C_WARNING}]", default=workspace_dir).strip('"')
+                    if novo_ws:
+                        novo_ws = os.path.abspath(novo_ws)
                     if novo_ws and os.path.exists(novo_ws):
                         workspace_dir = novo_ws
                         save_config("General", "workspace", workspace_dir)
+                        try:
+                            os.chdir(workspace_dir)
+                        except Exception as e:
+                            notify_error(f"Erro ao acessar {workspace_dir}: {e}")
                         notify_success(f"Workspace alterado para: {workspace_dir}")
                         
                         if "ducktools" in mcp_config.get("mcpServers", {}):

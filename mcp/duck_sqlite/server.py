@@ -6,16 +6,26 @@ from mcp.server.fastmcp import FastMCP
 
 # Configuração do Workspace
 WORKSPACE_DIR = Path(os.getenv("WORKSPACE_DIR", os.getcwd())).resolve()
+try:
+    os.chdir(WORKSPACE_DIR)
+except Exception as e:
+    pass
 
 # Inicializa o servidor FastMCP
 mcp = FastMCP("DuckTools - SQLite MCP")
 
 def get_safe_path(filepath: str) -> Path:
-    """Resolve o caminho e garante que ele seja acessível."""
-    target_path = Path(filepath).resolve()
-    # Se o path for relativo, considera a partir do WORKSPACE_DIR
-    if not target_path.is_absolute():
-        target_path = (WORKSPACE_DIR / filepath).resolve()
+    """Resolve o caminho e garante que ele seja acessível dentro do workspace."""
+    try:
+        target_path = Path(os.path.join(WORKSPACE_DIR, filepath)).resolve()
+    except Exception:
+        target_path = Path(os.path.join(WORKSPACE_DIR, filepath)).absolute()
+        
+    # Garante que não saia do workspace
+    try:
+        target_path.relative_to(WORKSPACE_DIR)
+    except ValueError:
+        raise ValueError(f"Acesso negado: O caminho {filepath} está fora do workspace.")
     
     return target_path
 

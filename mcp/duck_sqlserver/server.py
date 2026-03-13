@@ -1,7 +1,15 @@
 import os
 import pyodbc
+from pathlib import Path
 from mcp.server.fastmcp import FastMCP
 import json
+
+# Configuração do Workspace
+WORKSPACE_DIR = Path(os.getenv("WORKSPACE_DIR", os.getcwd())).resolve()
+try:
+    os.chdir(WORKSPACE_DIR)
+except Exception as e:
+    pass
 
 # Inicializa o servidor FastMCP
 mcp = FastMCP("DuckTools - SQL Server MCP")

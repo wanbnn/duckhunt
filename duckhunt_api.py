@@ -20,6 +20,8 @@ from app import (
     compor_prompt_sistema,
     SYSTEM_PROMPT,
     MCP_CONFIG_PATH,
+    BASE_DIR,
+    load_config,
     status_bar,
     notify_error,
     console
@@ -44,6 +46,16 @@ async def lifespan(app: FastAPI):
     
     # 1. Carrega o Modelo (deve estar configurado no config.ini ou via CLI previamente)
     print("Iniciando DuckHunt API...")
+    
+    # Altera para o workspace
+    workspace_dir = load_config("General", "workspace")
+    if workspace_dir and os.path.exists(workspace_dir):
+        try:
+            os.chdir(workspace_dir)
+            print(f"Workspace configurado para: {workspace_dir}")
+        except Exception as e:
+            print(f"Erro ao acessar workspace {workspace_dir}: {e}")
+            
     _llm = await autoload_model()
     if getattr(app.state, "duckhunt_test", False):
         yield
@@ -76,8 +88,16 @@ async def lifespan(app: FastAPI):
                 if typ == "stdio":
                     cmd = srv_cfg.get("command", "python")
                     if cmd in ("python", "python.exe", "python3"): cmd = sys.executable
+                    
+                    args = []
+                    for arg in srv_cfg.get("args", []):
+                        if arg.startswith("mcp/") or arg.startswith("mcp\\"):
+                            args.append(os.path.join(BASE_DIR, arg))
+                        else:
+                            args.append(arg)
+                            
                     env = {**os.environ, **srv_cfg.get("env", {})}
-                    params = StdioServerParameters(command=cmd, args=srv_cfg.get("args", []), env=env)
+                    params = StdioServerParameters(command=cmd, args=args, env=env)
                     read, write = await _mcp_stack.enter_async_context(stdio_client(params))
                 else:
                     try:

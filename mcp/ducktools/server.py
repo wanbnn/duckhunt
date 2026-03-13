@@ -7,6 +7,11 @@ from mcp.server.fastmcp import FastMCP
 
 # Configuração do Workspace
 WORKSPACE_DIR = Path(os.getenv("WORKSPACE_DIR", os.getcwd())).resolve()
+try:
+    os.chdir(WORKSPACE_DIR)
+except Exception as e:
+    print(f"Warning: could not chdir to {WORKSPACE_DIR}: {e}")
+
 SKILLS_DIR = (Path(__file__).parent.parent.parent / "skills").resolve()
 TODO_FILE = WORKSPACE_DIR / ".mcp_todo.json"
 
@@ -23,13 +28,22 @@ mcp = FastMCP("DuckTools MCP")
 # --- FUNÇÕES AUXILIARES ---
 
 def get_safe_path(filepath: str) -> Path:
-    target_path = (WORKSPACE_DIR / filepath).resolve()
+    # Resolve caminhos e normaliza para evitar inconsistências de drive/case no Windows
+    try:
+        target_path = Path(os.path.join(WORKSPACE_DIR, filepath)).resolve()
+    except Exception:
+        target_path = Path(os.path.join(WORKSPACE_DIR, filepath)).absolute()
     
-    # Permite acesso ao Workspace OU à pasta de Skills
-    in_workspace = str(target_path).startswith(str(WORKSPACE_DIR))
-    in_skills = str(target_path).startswith(str(SKILLS_DIR))
-    
-    if not (in_workspace or in_skills):
+    # Verifica se o caminho está dentro do Workspace ou da pasta de Skills
+    # Usamos commonpath para maior robustez em comparação a startswith puro
+    def is_relative_to(p, parent):
+        try:
+            p.relative_to(parent)
+            return True
+        except ValueError:
+            return False
+
+    if not (is_relative_to(target_path, WORKSPACE_DIR) or is_relative_to(target_path, SKILLS_DIR)):
         raise ValueError(f"Acesso negado: Path Traversal detectado para {filepath}")
     return target_path
 
@@ -240,20 +254,63 @@ def fetch_webpage(url: str, extract_text: bool = True) -> str:
     except Exception as e: return f"Erro inesperado: {str(e)}"
 
 @mcp.tool()
+def delete_files(filepaths: list[str]) -> str:
+    """
+    Remove um ou mais arquivos ou diretórios do workspace de forma segura.
+    Use esta ferramenta em vez de comandos 'rm' no terminal para evitar timeouts.
+    """
+    results = []
+    import shutil
+    for fp in filepaths:
+        try:
+            path = get_safe_path(fp)
+            if not path.exists():
+                results.append(f"Ignorado: '{fp}' não existe.")
+                continue
+            
+            if path.is_file() or path.is_symlink():
+                path.unlink()
+                results.append(f"Sucesso: Arquivo '{fp}' removido.")
+            elif path.is_dir():
+                shutil.rmtree(path)
+                results.append(f"Sucesso: Diretório '{fp}' removido.")
+        except Exception as e:
+            results.append(f"Erro ao remover '{fp}': {str(e)}")
+    return "\n".join(results)
+
+@mcp.tool()
 def execute_command(command: str) -> str:
-    """Executa um comando de terminal. A saída é truncada se for muito longa."""
+    """
+    Executa um comando de terminal no workspace. 
+    No Windows, usa PowerShell. No Linux/macOS, usa Bash.
+    """
     try:
+        if os.name == 'nt':
+            # Windows: Força uso do PowerShell para consistência
+            actual_cmd = ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command]
+            shell_mode = False
+        else:
+            # Linux/macOS: Força uso do Bash
+            actual_cmd = ["/bin/bash", "-c", command]
+            shell_mode = False
+
         result = subprocess.run(
-            command, shell=True, cwd=WORKSPACE_DIR, capture_output=True, text=True, timeout=30
+            actual_cmd, 
+            shell=shell_mode, 
+            cwd=WORKSPACE_DIR, 
+            capture_output=True, 
+            text=True, 
+            stdin=subprocess.DEVNULL # Evita travar esperando entrada do usuário (crucial)
         )
         output = f"Exit code: {result.returncode}\n"
         output += f"STDOUT:\n{result.stdout}\n" if result.stdout else ""
         output += f"STDERR:\n{result.stderr}\n" if result.stderr else ""
         
-        # Otimização de token: Trunca a saída se for um log gigante (ex: npm install)
         if len(output) > MAX_CMD_OUTPUT_LENGTH:
-            return output[:MAX_CMD_OUTPUT_LENGTH] + "\n\n...[SAÍDA TRUNCADA PARA ECONOMIZAR TOKENS]..."
+            return output[:MAX_CMD_OUTPUT_LENGTH] + "\n\n...[SAÍDA TRUNCADA]..."
         return output
+    except subprocess.TimeoutExpired:
+        return f"Erro: O comando excedeu o tempo limite de 60 segundos."
     except Exception as e:
         return f"Erro ao executar comando: {str(e)}"
 

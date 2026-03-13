@@ -186,7 +186,24 @@ class UnifiedLLM:
                 print(f"Erro API Anthropic: {e}")
             return
 
-        kwargs = {"messages": messages, "stream": stream, "model": self.model_name}
+        clean_messages = []
+        gemini_messages = []
+        for m in messages:
+            clean_m = {k: v for k, v in m.items() if k != "extra_content"}
+            if clean_m.get("tool_calls"):
+                clean_m["tool_calls"] = [
+                    {k: v for k, v in tc.items() if k != "extra_content"} 
+                    for tc in clean_m["tool_calls"]
+                ]
+            clean_messages.append(clean_m)
+            
+            if self.model_type == "gemini":
+                gemini_m = {k: v for k, v in m.items()}
+                if gemini_m.get("tool_calls"):
+                    gemini_m["tool_calls"] = [tc.copy() for tc in gemini_m["tool_calls"]]
+                gemini_messages.append(gemini_m)
+
+        kwargs = {"messages": clean_messages, "stream": stream, "model": self.model_name}
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = tool_choice
@@ -194,6 +211,17 @@ class UnifiedLLM:
         if self.model_type in ("openai", "gemini"):
             if max_tokens: kwargs["max_tokens"] = max_tokens
             if temperature: kwargs["temperature"] = temperature
+            
+        if self.model_type == "gemini":
+            # Ensure thought_signature is present on ALL tool calls in assistant messages
+            for m in gemini_messages:
+                if m.get("role") == "assistant" and m.get("tool_calls"):
+                    ext = next((tc.get("extra_content") for tc in m["tool_calls"] if tc.get("extra_content")), None)
+                    if ext:
+                        for tc in m["tool_calls"]:
+                            tc["extra_content"] = ext
+            kwargs["extra_body"] = {"messages": gemini_messages}
+            
         try:
             response = self.client.chat.completions.create(**kwargs)
             if stream:
@@ -206,26 +234,41 @@ class UnifiedLLM:
             print(f"Erro API ({self.model_type}): {e}")
 
     def _convert_chunk(self, chunk):
-        if not hasattr(chunk, "choices") or not chunk.choices: return {}
-        choice = chunk.choices[0]
-        delta = choice.delta
-        delta_dict = {}
-        if delta.content is not None: delta_dict["content"] = delta.content
-        if getattr(delta, "tool_calls", None):
-            delta_dict["tool_calls"] = []
-            for tc in delta.tool_calls:
-                if hasattr(tc, "model_dump"):
-                    tc_dict = tc.model_dump(exclude_unset=True)
+        if hasattr(chunk, "model_dump"):
+            chunk_dict = chunk.model_dump(exclude_unset=True)
+        elif hasattr(chunk, "dict"):
+            chunk_dict = chunk.dict(exclude_unset=True)
+        else:
+            chunk_dict = chunk if isinstance(chunk, dict) else vars(chunk)
+
+        choices = chunk_dict.get("choices", [])
+        if not choices: return {}
+        
+        choice = choices[0]
+        delta_dict = choice.get("delta", {})
+        
+        # O model_dump() do Pydantic já inclui automaticamente todos os campos extras
+        if hasattr(chunk, "choices") and chunk.choices:
+            raw_delta = chunk.choices[0].delta
+            if hasattr(raw_delta, "extra_content") and getattr(raw_delta, "extra_content", None):
+                if isinstance(raw_delta.extra_content, dict):
+                    delta_dict.setdefault("extra_content", {}).update(raw_delta.extra_content)
                 else:
-                    tc_dict = {"index": getattr(tc, "index", None)}
-                    if getattr(tc, "id", None): tc_dict["id"] = tc.id
-                    if getattr(tc, "type", None): tc_dict["type"] = tc.type
-                    if getattr(tc, "function", None):
-                        tc_dict["function"] = {}
-                        if getattr(tc.function, "name", None): tc_dict["function"]["name"] = tc.function.name
-                        if getattr(tc.function, "arguments", None): tc_dict["function"]["arguments"] = tc.function.arguments
-                delta_dict["tool_calls"].append(tc_dict)
-        return {"choices": [{"delta": delta_dict, "finish_reason": choice.finish_reason}]}
+                    delta_dict["extra_content"] = raw_delta.extra_content
+                    
+            raw_tcs = getattr(raw_delta, "tool_calls", None)
+            if raw_tcs and "tool_calls" in delta_dict:
+                for i, raw_tc in enumerate(raw_tcs):
+                    if i < len(delta_dict["tool_calls"]):
+                        tc_dict = delta_dict["tool_calls"][i]
+                        ext = getattr(raw_tc, "extra_content", None)
+                        if ext:
+                            if isinstance(ext, dict):
+                                tc_dict.setdefault("extra_content", {}).update(ext)
+                            else:
+                                tc_dict["extra_content"] = ext
+
+        return {"choices": [{"delta": delta_dict, "finish_reason": choice.get("finish_reason")}]}
 
 # Sinais para comunicar o resultado das respostas do modelo (são executados em Threads para não travar a GUI)
 class AsyncSignals(QObject):
@@ -661,6 +704,17 @@ class DuckHuntGUI(QMainWindow):
 
     def compor_prompt(self):
         base = self.agent_prompt_text or ""
+        
+        essential_rules = """
+
+### SYSTEM CAPABILITIES & RULES
+1. You have tools available to perform actions (read/write files, run commands, etc.). You MUST use these tools to execute your tasks. NEVER ask the user to copy/paste code into files. ALWAYS use the tools to create or edit files yourself.
+2. If multiple MCP servers provide tools with similar names, the system may have prefixed them (e.g., ducktools_create_file). ALWAYS use the exact tool name provided in your tools schema.
+3. Call the tool, wait for the result, and if additional context is needed, read the file first before proceeding.
+"""
+        if "### ABSOLUTE RULES" not in base and "SYSTEM CAPABILITIES & RULES" not in base:
+            base += essential_rules
+            
         if not self.skills_prompts: return base
         partes = [base, "\n\n### ACTIVE SKILLS\n"]
         for sp in self.skills_prompts:

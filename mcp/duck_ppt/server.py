@@ -2,10 +2,18 @@
 PowerPoint MCP Server v4 — Template-first, UI/UX focused.
 Built to produce professional slides that USE the template correctly.
 """
-import os, re, json, subprocess
+import os, re, json
 import win32com.client
+from pathlib import Path
 from mcp.server.fastmcp import FastMCP
 from typing import List, Dict, Optional, Any
+
+# Configuração do Workspace
+WORKSPACE_DIR = Path(os.getenv("WORKSPACE_DIR", os.getcwd())).resolve()
+try:
+    os.chdir(WORKSPACE_DIR)
+except Exception as e:
+    pass
 
 mcp = FastMCP("PowerPoint MCP")
 
@@ -442,6 +450,7 @@ def create_presentation(template_name: str) -> str:
 def open_presentation(file_path: str) -> str:
     """Open an existing .pptx file for editing."""
     try:
+        file_path = str(Path(file_path).resolve())
         if not os.path.exists(file_path):
             return f"File not found: {file_path}"
         _app().Presentations.Open(file_path, ReadOnly=0, Untitled=msoFalse, WithWindow=msoTrue)
@@ -1067,7 +1076,8 @@ def save_presentation(file_path: str) -> str:
     """Save the active presentation to a .pptx file."""
     try:
         prs = _prs()
-        os.makedirs(os.path.dirname(file_path) or ".", exist_ok=True)
+        file_path = str(Path(file_path).resolve())
+        os.makedirs(os.path.dirname(file_path), exist_ok=True)
         prs.SaveAs(file_path)
         return f"Saved: {file_path}"
     except Exception as e:
