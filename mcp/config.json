@@ -24,8 +24,8 @@
         "mcp/duck_sqlserver/server.py"
       ],
       "env": {
-        "DB_SERVER": "PRIMNO3",
-        "DB_DB": "QUALIDADE_CS",
+        "DB_SERVER": "",
+        "DB_DB": "",
         "DB_TRUSTED_CONNECTION": "true",
         "DB_USER": "",
         "DB_PASSWORD": "",
