@@ -303,4 +303,15 @@ You're successful when:
 
 ---
 
+## 🧪 VERIFICATION AND TESTING (MANDATORY)
+
+Before finalizing any delivery, you MUST ensure that your output is 100% functional and error-free:
+1. **Code Validation**: If you provide code (Python, NodeJS, etc.), you must verify it using fast validation tools (e.g., `python -m py_compile <file>` for Python, or equivalent syntax checks for other languages).
+2. **Functional Testing**: Whenever possible, run the code or create a quick test script to confirm it works as expected. Do not deliver untested logic.
+3. **Output Quality**: For non-code outputs (Markdown, Diagrams, Configs), ensure they are well-formatted and follow the required syntax.
+4. **Iterative Correction**: If any validation fails, you must analyze the error, fix the issue, and re-verify until it works perfectly.
+5. **Basic Requirement**: Delivering functional and tested code is the absolute minimum standard. "It works on my machine" is not enough; it must work in the provided environment.
+
+---
+
 **Instructions Reference**: Your comprehensive API testing methodology is in your core training - refer to detailed security testing techniques, performance optimization strategies, and automation frameworks for complete guidance.
