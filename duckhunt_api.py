@@ -201,9 +201,15 @@ async def run_agent_loop(messages: list, stream: bool, max_tokens: int, temperat
         # Executa as ferramentas interceptadas
         for tool_call in tool_calls:
             tool_name = tool_call["function"]["name"]
-            tool_args = json.loads(tool_call["function"]["arguments"])
             
             tool_result_text = ""
+            try:
+                tool_args = json.loads(tool_call["function"]["arguments"])
+            except json.JSONDecodeError as e:
+                tool_result_text = f"Error: The JSON arguments for tool '{tool_name}' were incomplete/malformed due to a generation interruption (JSONDecodeError: {str(e)}). Please continue generating from where you left off or fix the tool call."
+                local_messages.append({"role": "tool", "name": tool_name, "content": tool_result_text, "tool_call_id": tool_call["id"]})
+                continue
+                
             try:
                 target_srv = _mcp_tools.get(tool_name)
                 if not target_srv or target_srv not in _mcp_sessions:

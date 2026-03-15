@@ -16,7 +16,7 @@ SKILLS_DIR = (Path(__file__).parent.parent.parent / "skills").resolve()
 TODO_FILE = WORKSPACE_DIR / ".mcp_todo.json"
 
 # Limites para economizar tokens
-MAX_LINES_PER_READ = 400
+MAX_LINES_PER_READ = 1200
 MAX_SEARCH_RESULTS = 10
 MAX_CMD_OUTPUT_LENGTH = 3000
 

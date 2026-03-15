@@ -916,7 +916,14 @@ class DuckHuntGUI(QMainWindow):
         try:
             for tc in tool_calls:
                 tname = tc["function"]["name"]
-                targs = json.loads(tc["function"]["arguments"])
+                try:
+                    targs = json.loads(tc["function"]["arguments"])
+                except json.JSONDecodeError as e:
+                    self.append_chat("❌ Erro", f"JSON incompleto para a ferramenta '{tname}'. Solicitando continuação...", "#FF6B6B")
+                    result_txt = f"Error: The JSON arguments for tool '{tname}' were incomplete/malformed due to a generation interruption (JSONDecodeError: {str(e)}). Please continue generating from where you left off or fix the tool call."
+                    self.messages.append({"role": "tool", "name": tname, "content": result_txt, "tool_call_id": tc.get("id")})
+                    continue
+                    
                 self.append_chat("⚙ Executando", f"{tname} - {json.dumps(targs, ensure_ascii=False)[:100]}...", "#FF8E53")
                 
                 srv = self.mcp_tools.get(tname)
@@ -1438,6 +1445,10 @@ class DuckHuntGUI(QMainWindow):
                                 else:
                                     shared_history.append({"role": "tool", "name": tname, "content": "Erro: MCP inativo", "tool_call_id": tc.get("id")})
                                     self._ma_append(f"❌ {a['name']}", f"<b>{tname}</b>: MCP inativo.", "#F38BA8")
+                            except json.JSONDecodeError as e:
+                                err_msg = f"Error: The JSON arguments for tool '{tname}' were incomplete/malformed due to a generation interruption (JSONDecodeError: {str(e)}). Please continue generating from where you left off or fix the tool call."
+                                shared_history.append({"role": "tool", "name": tname, "content": err_msg, "tool_call_id": tc.get("id")})
+                                self._ma_append(f"❌ {a['name']}", f"JSON incompleto em {tname}. Solicitando continuação...", "#F38BA8")
                             except Exception as e:
                                 shared_history.append({"role": "tool", "name": tname, "content": f"Erro: {e}", "tool_call_id": tc.get("id")})
                                 self._ma_append(f"❌ {a['name']}", f"Erro em {tname}: {e}", "#F38BA8")

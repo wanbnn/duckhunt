@@ -259,6 +259,33 @@ You have **tools (Tools / Function Calling)** to interact with the system.
    - **ONLY AFTER** closing the `</think>` tag, you should provide the final response or tool calls.
 """
 
+def get_safe_truncated_messages(messages, percent):
+    if len(messages) <= 3:
+        return messages
+    
+    system_msg = messages[0]
+    history = messages[1:]
+    
+    target_history_len = max(1, int(len(history) * percent))
+    
+    safe_history = []
+    needed_tool_calls = set()
+    
+    for msg in reversed(history):
+        if len(safe_history) >= target_history_len and not needed_tool_calls:
+            break
+            
+        safe_history.insert(0, msg)
+        
+        if msg.get("role") == "tool":
+            needed_tool_calls.add(msg.get("tool_call_id"))
+            
+        elif msg.get("role") == "assistant" and msg.get("tool_calls"):
+            for tc in msg["tool_calls"]:
+                needed_tool_calls.discard(tc.get("id"))
+                
+    return [system_msg] + safe_history
+
 class UnifiedLLM:
     def __init__(self, client, model_type, model_name):
         self.client = client
@@ -402,7 +429,7 @@ class UnifiedLLM:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = tool_choice
 
-        if self.model_type in ("openai", "gemini"):
+        if self.model_type in ("openai", "gemini", "custom_openai"):
             if max_tokens: kwargs["max_tokens"] = max_tokens
             if temperature: kwargs["temperature"] = temperature
             
@@ -422,7 +449,8 @@ class UnifiedLLM:
             else:
                 yield self._convert_chunk(response)
         except Exception as e:
-            console.print(f"[red]Erro API ({self.model_type}): {e}[/red]")
+            # Re-raise so stream_and_accumulate can catch and return it as a structured error
+            raise e
 
     def _convert_chunk(self, chunk):
         if hasattr(chunk, "model_dump"):
@@ -723,105 +751,108 @@ def stream_and_accumulate(llm, messages, tools):
 
     # Live UI para atualizar a interface fluida
     with Live(auto_refresh=True, console=console, refresh_per_second=15) as live:
-        for chunk in response_gen:
-            delta = chunk["choices"][0].get("delta", {})
-            
-            if "content" in delta and delta["content"]:
-                raw_content += delta["content"]
-                message["content"] += delta["content"]
+        try:
+            for chunk in response_gen:
+                delta = chunk["choices"][0].get("delta", {})
                 
-                # --- PARSER DO BLOCO DE PENSAMENTO ---
-                think_text = ""
-                main_text = ""
-                
-                # Checa se existe a tag <think>
-                if "<think>" in raw_content:
-                    parts = raw_content.split("<think>", 1)
-                    main_text += parts[0]
+                if "content" in delta and delta["content"]:
+                    raw_content += delta["content"]
+                    message["content"] += delta["content"]
                     
-                    think_parts = parts[1].split("</think>", 1)
-                    think_text = think_parts[0]
+                    # --- PARSER DO BLOCO DE PENSAMENTO ---
+                    think_text = ""
+                    main_text = ""
                     
-                    if len(think_parts) > 1:
-                        main_text += think_parts[1]
-                else:
-                    main_text = raw_content
-                
-                # --- MONTAGEM DA INTERFACE RICH ---
-                renderables = []
-                if think_text.strip():
-                    renderables.append(
-                        Panel(
-                            Text(think_text.strip(), style="dim italic"), 
-                            title="🧠 Processo de Pensamento", 
-                            border_style="dim",
-                            padding=(0, 1)
-                        )
-                    )
-                if main_text.strip():
-                    renderables.append(Markdown(main_text.strip()))
-                
-                # Atualiza a tela ao vivo
-                if renderables:
-                    live.update(Group(*renderables))
-                
-            # Acumula chamadas de ferramentas nativas
-            if "tool_calls" in delta and delta["tool_calls"]:
-                for tc_chunk in delta["tool_calls"]:
-                    index = tc_chunk.get("index")
-                    if index is None:
-                        tc_id = tc_chunk.get("id")
-                        if tc_id:
-                            found_idx = next((i for i, t in enumerate(message["tool_calls"]) if t.get("id") == tc_id), None)
-                            if found_idx is not None:
-                                index = found_idx
-                            else:
-                                index = len(message["tool_calls"])
-                        else:
-                            index = max(0, len(message["tool_calls"]) - 1)
-                            
-                    while len(message["tool_calls"]) <= index:
-                        message["tool_calls"].append({
-                            "id": "", "type": "function", "function": {"name": "", "arguments": ""}
-                        })
-                    tc_acc = message["tool_calls"][index]
-                    
-                    for k, v in tc_chunk.items():
-                        if k == "index": continue
-                        if k == "function" and isinstance(v, dict):
-                            for fk, fv in v.items():
-                                if fv is not None:
-                                    if fk in ["name", "arguments"]:
-                                        tc_acc["function"][fk] = tc_acc["function"].get(fk, "") + str(fv)
-                                    else:
-                                        if isinstance(fv, str):
-                                            tc_acc["function"][fk] = tc_acc["function"].get(fk, "") + fv
-                                        else:
-                                            tc_acc["function"][fk] = fv
-                        elif v is not None:
-                            if k == "type":
-                                tc_acc[k] = v # Não concatena 'type' para evitar 'functionfunction' no Azure
-                            elif k == "id":
-                                tc_acc[k] = tc_acc.get(k, "") + str(v)
-                            else:
-                                if isinstance(v, str):
-                                    tc_acc[k] = tc_acc.get(k, "") + v
-                                else:
-                                    tc_acc[k] = v
-                                    
-                    # Accumulate extra_content for Gemini
-                    if "extra_content" in tc_chunk and tc_chunk["extra_content"]:
-                        if "extra_content" not in tc_acc or not isinstance(tc_acc["extra_content"], dict): 
-                            tc_acc["extra_content"] = {}
-                        if isinstance(tc_chunk["extra_content"], dict):
-                            tc_acc["extra_content"].update(tc_chunk["extra_content"])
+                    # Checa se existe a tag <think>
+                    if "<think>" in raw_content:
+                        parts = raw_content.split("<think>", 1)
+                        main_text += parts[0]
                         
-            # Accumulate top-level extra_content for Gemini
-            if "extra_content" in delta and delta["extra_content"]:
-                if "extra_content" not in message or not isinstance(message["extra_content"], dict): 
-                    message["extra_content"] = {}
-                if isinstance(delta["extra_content"], dict):
-                    message["extra_content"].update(delta["extra_content"])
+                        think_parts = parts[1].split("</think>", 1)
+                        think_text = think_parts[0]
+                        
+                        if len(think_parts) > 1:
+                            main_text += think_parts[1]
+                    else:
+                        main_text = raw_content
+                    
+                    # --- MONTAGEM DA INTERFACE RICH ---
+                    renderables = []
+                    if think_text.strip():
+                        renderables.append(
+                            Panel(
+                                Text(think_text.strip(), style="dim italic"), 
+                                title="🧠 Processo de Pensamento", 
+                                border_style="dim",
+                                padding=(0, 1)
+                            )
+                        )
+                    if main_text.strip():
+                        renderables.append(Markdown(main_text.strip()))
+                    
+                    # Atualiza a tela ao vivo
+                    if renderables:
+                        live.update(Group(*renderables))
+                    
+                # Acumula chamadas de ferramentas nativas
+                if "tool_calls" in delta and delta["tool_calls"]:
+                    for tc_chunk in delta["tool_calls"]:
+                        index = tc_chunk.get("index")
+                        if index is None:
+                            tc_id = tc_chunk.get("id")
+                            if tc_id:
+                                found_idx = next((i for i, t in enumerate(message["tool_calls"]) if t.get("id") == tc_id), None)
+                                if found_idx is not None:
+                                    index = found_idx
+                                else:
+                                    index = len(message["tool_calls"])
+                            else:
+                                index = max(0, len(message["tool_calls"]) - 1)
+                                
+                        while len(message["tool_calls"]) <= index:
+                            message["tool_calls"].append({
+                                "id": "", "type": "function", "function": {"name": "", "arguments": ""}
+                            })
+                        tc_acc = message["tool_calls"][index]
+                        
+                        for k, v in tc_chunk.items():
+                            if k == "index": continue
+                            if k == "function" and isinstance(v, dict):
+                                for fk, fv in v.items():
+                                    if fv is not None:
+                                        if fk in ["name", "arguments"]:
+                                            tc_acc["function"][fk] = tc_acc["function"].get(fk, "") + str(fv)
+                                        else:
+                                            if isinstance(fv, str):
+                                                tc_acc["function"][fk] = tc_acc["function"].get(fk, "") + fv
+                                            else:
+                                                tc_acc["function"][fk] = fv
+                            elif v is not None:
+                                if k == "type":
+                                    tc_acc[k] = v # Não concatena 'type' para evitar 'functionfunction' no Azure
+                                elif k == "id":
+                                    tc_acc[k] = tc_acc.get(k, "") + str(v)
+                                else:
+                                    if isinstance(v, str):
+                                        tc_acc[k] = tc_acc.get(k, "") + v
+                                    else:
+                                        tc_acc[k] = v
+                                        
+                        # Accumulate extra_content for Gemini
+                        if "extra_content" in tc_chunk and tc_chunk["extra_content"]:
+                            if "extra_content" not in tc_acc or not isinstance(tc_acc["extra_content"], dict): 
+                                tc_acc["extra_content"] = {}
+                            if isinstance(tc_chunk["extra_content"], dict):
+                                tc_acc["extra_content"].update(tc_chunk["extra_content"])
+                            
+                # Accumulate top-level extra_content for Gemini
+                if "extra_content" in delta and delta["extra_content"]:
+                    if "extra_content" not in message or not isinstance(message["extra_content"], dict): 
+                        message["extra_content"] = {}
+                    if isinstance(delta["extra_content"], dict):
+                        message["extra_content"].update(delta["extra_content"])
+        except Exception as e:
+            return {"error": str(e)}
                         
     # --- FALLBACK: PARSER MANUAL DE TOOL CALL ---
     if not message["tool_calls"] and "<tool_call>" in message["content"]:
@@ -936,7 +967,7 @@ async def adicionar_nova_api():
     
     tipo = Prompt.ask(
         "[yellow]Escolha o tipo de API[/yellow]", 
-        choices=["OpenAI", "Azure", "Anthropic", "Gemini"], 
+        choices=["OpenAI", "Azure", "Anthropic", "Gemini", "Custom_OpenAi"], 
         default="OpenAI"
     )
     
@@ -962,6 +993,12 @@ async def adicionar_nova_api():
         modelo = Prompt.ask("[yellow]Nome do modelo (ex: gemini-2.0-flash)[/yellow]")
         api_key = Prompt.ask("[yellow]API Key[/yellow]", password=True)
         novo_modelo = {tipo: {"model": modelo, "api_key": api_key}}
+
+    elif tipo == "Custom_OpenAi":
+        modelo = Prompt.ask("[yellow]Nome do modelo (ex: meta/llama-3.1-70b-instruct)[/yellow]")
+        url_base = Prompt.ask("[yellow]Base URL compatível com OpenAI (ex: https://integrate.api.nvidia.com/v1)[/yellow]")
+        api_key = Prompt.ask("[yellow]API Key[/yellow]", password=True)
+        novo_modelo = {tipo: {"model": modelo, "url_base": url_base, "api_key": api_key}}
 
     api_cfg_path = os.path.join(MODELS_DIR, "api_config.json")
     data = []
@@ -1059,6 +1096,10 @@ async def gerenciar_modelos(current_llm):
                             cfg["deployment"] = Prompt.ask("[yellow]Nome do Deployment[/yellow]", default=cfg.get("deployment", ""))
                             cfg["endpoint"] = Prompt.ask("[yellow]Endpoint com API Version[/yellow]", default=cfg.get("endpoint", ""))
                             cfg["api_key"] = Prompt.ask("[yellow]API Key[/yellow]", password=True, default=cfg.get("api_key", ""))
+                        elif tipo == "Custom_OpenAi":
+                            cfg["model"] = Prompt.ask("[yellow]Nome do modelo[/yellow]", default=cfg.get("model", ""))
+                            cfg["url_base"] = Prompt.ask("[yellow]Base URL[/yellow]", default=cfg.get("url_base", ""))
+                            cfg["api_key"] = Prompt.ask("[yellow]API Key[/yellow]", password=True, default=cfg.get("api_key", ""))
                         else:
                             cfg["model"] = Prompt.ask("[yellow]Nome do modelo[/yellow]", default=cfg.get("model", ""))
                             cfg["api_key"] = Prompt.ask("[yellow]API Key[/yellow]", password=True, default=cfg.get("api_key", ""))
@@ -1129,6 +1170,17 @@ async def gerenciar_modelos(current_llm):
                         save_config("Model", "type", "openai")
                         save_config("Model", "name", mdl)
                         return UnifiedLLM(client, "openai", mdl)
+                    elif tipo == "Custom_OpenAi":
+                        client = OpenAI(
+                            api_key=cfg.get("api_key"),
+                            base_url=cfg.get("url_base")
+                        )
+                        mdl = cfg.get("model")
+                        console.print(f"[green]✓ Cliente Custom OpenAI ('{mdl}') configurado![/green]")
+                        notify_success(f"Custom OpenAI '{mdl}' configurado!")
+                        save_config("Model", "type", "custom_openai")
+                        save_config("Model", "name", mdl)
+                        return UnifiedLLM(client, "custom_openai", mdl)
                     elif tipo == "Gemini":
                         client = OpenAI(
                             api_key=cfg.get("api_key"),
@@ -1238,6 +1290,13 @@ async def autoload_model():
                                             client = OpenAI(api_key=v.get("api_key"))
                                             notify_success(f"OpenAI '{m_name}' restaurado.")
                                             return UnifiedLLM(client, "openai", m_name)
+                                        elif m_type == "custom_openai":
+                                            client = OpenAI(
+                                                api_key=v.get("api_key"),
+                                                base_url=v.get("url_base")
+                                            )
+                                            notify_success(f"Custom OpenAI '{m_name}' restaurado.")
+                                            return UnifiedLLM(client, "custom_openai", m_name)
                                         elif m_type == "gemini":
                                             client = OpenAI(
                                                 api_key=v.get("api_key"),
@@ -1543,7 +1602,8 @@ async def run_multi_agents(llm, tools, workspace_dir, mcp_sessions, mcp_tools, m
                 sys_prompt = f"{custom_base_sys}\n\n[Você é o '{name}' nesta rodada da equipe. Lembre-se, use [TASK_COMPLETED] se a missão de todos já estiver concluída e finalizada no projeto.]"
                 msgs = [{"role": "system", "content": sys_prompt}]
                 msgs.extend(shared_history)
-                streams.append(agentes_models[i].create_chat_completion(messages=msgs, tools=tools, tool_choice="auto", max_tokens=2048, stream=True))
+                current_msgs = get_safe_truncated_messages(msgs, 0.75)
+                streams.append(agentes_models[i].create_chat_completion(messages=current_msgs, tools=tools, tool_choice="auto", max_tokens=2048, stream=True))
 
             async def consume_stream(i, generator):
                 message = {"role": "assistant", "content": "", "tool_calls": []}
@@ -1703,6 +1763,10 @@ async def run_multi_agents(llm, tools, workspace_dir, mcp_sessions, mcp_tools, m
                             else:
                                 agent_texts[i] += f"\n[{C_ERROR}]✗ {tname}: MCP inativo[/{C_ERROR}]\n"
                                 shared_history.append({"role": "tool", "name": tname, "content": f"Erro: MCP inativo", "tool_call_id": tc.get("id")})
+                        except json.JSONDecodeError as e:
+                            agent_texts[i] += f"\n[{C_ERROR}]✗ {tname}: JSON incompleto[/{C_ERROR}]\n"
+                            err_msg = f"Error: The JSON arguments for tool '{tname}' were incomplete/malformed due to a generation interruption (JSONDecodeError: {str(e)}). Please continue generating from where you left off or fix the tool call."
+                            shared_history.append({"role": "tool", "name": tname, "content": err_msg, "tool_call_id": tc.get("id")})
                         except Exception as e:
                             agent_texts[i] += f"\n[{C_ERROR}]✗ {tname}: {e}[/{C_ERROR}]\n"
                             shared_history.append({"role": "tool", "name": tname, "content": f"Erro de processamento: {e}", "tool_call_id": tc.get("id")})
@@ -2049,83 +2113,163 @@ async def run_chat_loop():
                     })
                     
                     # Executa a geração em uma thread para não bloquear o Asyncio
-                    message = await asyncio.to_thread(stream_and_accumulate, llm, messages, ai_tools)
-                    messages.append(message) 
-                    
-                    if "tool_calls" not in message:
-                        break
-                    
-                    # Processa as ferramentas com visual aprimorado
-                    for tool_call in message["tool_calls"]:
-                        tool_name = tool_call["function"]["name"]
-                        tool_args = json.loads(tool_call["function"]["arguments"])
-                        
-                        tool_display = Text()
-                        tool_display.append("▸ ", style=f"bold {C_TOOL}")
-                        tool_display.append(tool_name, style=f"bold {C_WARNING}")
-                        tool_display.append(f"\n{json.dumps(tool_args, indent=2, ensure_ascii=False)[:300]}", style=C_DIM)
-                        console.print(Panel(
-                            tool_display,
-                            title=f"[bold {C_TOOL}]Tool Execution[/bold {C_TOOL}]",
-                            border_style=C_TOOL,
-                            expand=False,
-                            padding=(0, 1),
-                        ))
-                        
-                        # Animação de processamento
-                        with Live(console=console, refresh_per_second=12) as live:
-                            task_done = False
-                            frame_idx = 0
-                            
-                            async def run_tool():
-                                nonlocal task_done
-                                try:
-                                    if tool_name == "load_duckhunt_skill":
-                                        req_skill = tool_args.get("skill_name")
-                                        if not req_skill:
-                                            return "Error: skill_name not provided."
-                                        if any(s.get("name") == req_skill for s in skills_prompts):
-                                            return f"Skill '{req_skill}' is already loaded in your context."
-                                            
-                                        sucesso = load_skill_by_name(req_skill, skills_prompts)
-                                        if sucesso:
-                                            messages[0]["content"] = compor_prompt_sistema(agent_prompt_text, skills_prompts)
-                                            notify_success(f"Skill '{req_skill}' ativada dinamicamente pelo modelo.")
-                                            return f"Success: Skill '{req_skill}' has been loaded. Its instructions are now available in your system prompt."
-                                        else:
-                                            return f"Error: Skill '{req_skill}' not found or failed to load."
-                                            
-                                    target_srv = mcp_tools.get(tool_name)
-                                    if not target_srv or target_srv not in mcp_sessions:
-                                        return f"Erro: Servidor MCP para a ferramenta '{tool_name}' não encontrado."
-                                    sess = mcp_sessions[target_srv]
-                                    original_tname = mcp_original_names.get(tool_name, tool_name)
-                                    result = await sess.call_tool(original_tname, tool_args)
-                                    return "\n".join([c.text for c in result.content if c.type == "text"])
-                                except Exception as e:
-                                    return f"Erro: {str(e)}"
-                                finally:
-                                    task_done = True
-                            
-                            tool_task = asyncio.create_task(run_tool())
-                            
-                            while not task_done:
-                                spinner = SPINNER_FRAMES[frame_idx % len(SPINNER_FRAMES)]
-                                anim_text = Text()
-                                anim_text.append(f"  {spinner} ", style=f"bold {C_PRIMARY}")
-                                anim_text.append("Processando...", style=f"{C_DIM} italic")
-                                live.update(anim_text)
-                                frame_idx += 1
-                                await asyncio.sleep(0.08)
-                            
-                            tool_result_text = await tool_task
-                        
-                        if tool_result_text.startswith("Erro:"):
-                            notify_error(tool_result_text)
+                    tentativas_api = 0
+                    while True:
+                        if tentativas_api == 0:
+                            ctx_percent = 0.75
+                        elif tentativas_api == 1:
+                            ctx_percent = 0.45
                         else:
-                            console.print(f"  [bold {C_SUCCESS}]✓[/bold {C_SUCCESS}] [{C_DIM}]Concluído[/{C_DIM}]")
+                            ctx_percent = 0.25
+                            
+                        current_msgs = get_safe_truncated_messages(messages, ctx_percent)
 
-                        messages.append({"role": "tool", "name": tool_name, "content": tool_result_text, "tool_call_id": tool_call["id"]})
+                        try:
+                            message = await asyncio.to_thread(stream_and_accumulate, llm, current_msgs, ai_tools)
+                            if "error" in message:
+                                raise Exception(message["error"])
+                            break
+                        except Exception as loop_e:
+                            err_str = str(loop_e).lower()
+                            
+                            # Check for common context length errors
+                            if any(k in err_str for k in ["context length", "token", "maximum context", "too large"]):
+                                notify_warning = f"Aviso de Contexto ({err_str[:60]}...)."
+                                console.print(f"[bold {C_WARNING}]⚠ {notify_warning}[/bold {C_WARNING}]")
+                                
+                                # Preserve ONLY the system prompt (index 0) and the most recent user request (the last one)
+                                if len(messages) > 2:
+                                    console.print(f"[{C_DIM}]Limpando histórico de contexto para reiniciar a conversa...[/{C_DIM}]")
+                                    # Keep [system_prompt, latest_user_message]
+                                    messages = [messages[0], messages[-1]]
+                                    # Reset API retries after context trim
+                                    tentativas_api = 0
+                                    continue
+                                else:
+                                    console.print(f"[bold {C_ERROR}]O erro de contexto persiste mesmo com contexto mínimo.[/{C_ERROR}]")
+                                    switch = Prompt.ask(f"[yellow]Deseja tentar outro modelo? (s/n)[/yellow]", default="s").strip().lower()
+                                    if switch == 's':
+                                        llm = await gerenciar_modelos(llm)
+                                        if not llm:
+                                            console.print("[red]Nenhum modelo selecionado. Cancelando geração.[/red]")
+                                            message = {"role": "assistant", "content": "Geração cancelada pelo usuário.", "tool_calls": []}
+                                            break
+                                        tentativas_api = 0
+                                        continue
+                                    else:
+                                        message = {"role": "assistant", "content": f"Erro não resolvido: {str(loop_e)}", "tool_calls": []}
+                                        break
+                                        
+                            # General Retry (429, timeouts, connections, 502, 503, peer closed, etc.)
+                            if tentativas_api < 2:
+                                notify_warning = f"Falha na comunicação com API ({str(loop_e)[:60]}...)."
+                                console.print(f"[bold {C_WARNING}]⚠ {notify_warning}[/bold {C_WARNING}]")
+                                console.print(f"[bold {C_WARNING}]Aguardando 30 segundos para retentar...[/bold {C_WARNING}]")
+                                
+                                # Wait for 30 seconds with a live countdown
+                                with Live(console=console, refresh_per_second=1) as live:
+                                    for rem in range(30, 0, -1):
+                                        next_perc = 45 if tentativas_api == 0 else 25
+                                        live.update(Text(f"  Retentando em {rem}s com {next_perc}% do contexto (Tentativa {tentativas_api + 2}/3)...", style=f"bold {C_WARNING}"))
+                                        await asyncio.sleep(1)
+                                tentativas_api += 1
+                                continue
+                            else:
+                                notify_error(f"Falha na geração após múltiplas tentativas: {loop_e}")
+                                message = {"role": "assistant", "content": f"Erro de API: {str(loop_e)}", "tool_calls": []}
+                                break
+
+                    if message and "role" in message:
+                        messages.append(message) 
+                        
+                        if "tool_calls" not in message or not message["tool_calls"]:
+                            break
+                        
+                        # Processa as ferramentas com visual aprimorado
+                        for tool_call in message["tool_calls"]:
+                            tool_name = tool_call["function"]["name"]
+                            try:
+                                tool_args = json.loads(tool_call["function"]["arguments"])
+                            except json.JSONDecodeError as e:
+                                notify_warning = f"A resposta do modelo foi interrompida (JSON incompleto na ferramenta '{tool_name}'). Solicitando continuação..."
+                                console.print(f"[bold {C_WARNING}]⚠ {notify_warning}[/bold {C_WARNING}]")
+                                
+                                # Simula um resultado de erro da ferramenta para forçar o modelo a continuar
+                                error_msg = f"Error: The JSON arguments for tool '{tool_name}' were incomplete/malformed due to a generation interruption (JSONDecodeError: {str(e)}). Please continue generating from where you left off or fix the tool call."
+                                messages.append({
+                                    "role": "tool", 
+                                    "name": tool_name, 
+                                    "content": error_msg, 
+                                    "tool_call_id": tool_call["id"]
+                                })
+                                continue
+                            
+                            tool_display = Text()
+                            tool_display.append("▸ ", style=f"bold {C_TOOL}")
+                            tool_display.append(tool_name, style=f"bold {C_WARNING}")
+                            tool_display.append(f"\n{json.dumps(tool_args, indent=2, ensure_ascii=False)[:300]}", style=C_DIM)
+                            console.print(Panel(
+                                tool_display,
+                                title=f"[bold {C_TOOL}]Tool Execution[/bold {C_TOOL}]",
+                                border_style=C_TOOL,
+                                expand=False,
+                                padding=(0, 1),
+                            ))
+                            
+                            # Animação de processamento
+                            with Live(console=console, refresh_per_second=12) as live:
+                                task_done = False
+                                frame_idx = 0
+                                
+                                async def run_tool():
+                                    nonlocal task_done
+                                    try:
+                                        if tool_name == "load_duckhunt_skill":
+                                            req_skill = tool_args.get("skill_name")
+                                            if not req_skill:
+                                                return "Error: skill_name not provided."
+                                            if any(s.get("name") == req_skill for s in skills_prompts):
+                                                return f"Skill '{req_skill}' is already loaded in your context."
+                                                
+                                            sucesso = load_skill_by_name(req_skill, skills_prompts)
+                                            if sucesso:
+                                                messages[0]["content"] = compor_prompt_sistema(agent_prompt_text, skills_prompts)
+                                                notify_success(f"Skill '{req_skill}' ativada dinamicamente pelo modelo.")
+                                                return f"Success: Skill '{req_skill}' has been loaded. Its instructions are now available in your system prompt."
+                                            else:
+                                                return f"Error: Skill '{req_skill}' not found or failed to load."
+                                                
+                                        target_srv = mcp_tools.get(tool_name)
+                                        if not target_srv or target_srv not in mcp_sessions:
+                                            return f"Erro: Servidor MCP para a ferramenta '{tool_name}' não encontrado."
+                                        sess = mcp_sessions[target_srv]
+                                        original_tname = mcp_original_names.get(tool_name, tool_name)
+                                        result = await sess.call_tool(original_tname, tool_args)
+                                        return "\n".join([c.text for c in result.content if c.type == "text"])
+                                    except Exception as e:
+                                        return f"Erro: {str(e)}"
+                                    finally:
+                                        task_done = True
+                                
+                                tool_task = asyncio.create_task(run_tool())
+                                
+                                while not task_done:
+                                    spinner = SPINNER_FRAMES[frame_idx % len(SPINNER_FRAMES)]
+                                    anim_text = Text()
+                                    anim_text.append(f"  {spinner} ", style=f"bold {C_PRIMARY}")
+                                    anim_text.append("Processando...", style=f"{C_DIM} italic")
+                                    live.update(anim_text)
+                                    frame_idx += 1
+                                    await asyncio.sleep(0.08)
+                                
+                                tool_result_text = await tool_task
+                            
+                            if isinstance(tool_result_text, str) and tool_result_text.startswith("Erro:"):
+                                notify_error(tool_result_text)
+                            else:
+                                console.print(f"  [bold {C_SUCCESS}]✓[/bold {C_SUCCESS}] [{C_DIM}]Concluído[/{C_DIM}]")
+
+                            messages.append({"role": "tool", "name": tool_name, "content": tool_result_text, "tool_call_id": tool_call["id"]})
 
             except KeyboardInterrupt:
                 console.print("\n[dim italic]Operação cancelada. Digite '/sair' para encerrar.[/dim italic]")
