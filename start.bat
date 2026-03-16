@@ -1,6 +1,24 @@
 @ECHO OFF
 title DUCKHUNT - [CLI]
 
+REM --- Configurar atalho global duckhunt ---
+SET "DH_PATH=%~dp0"
+IF "%DH_PATH:~-1%"=="\" SET "DH_PATH=%DH_PATH:~0,-1%"
+
+REM Salvar o caminho do duckhunt com setx
+setx DUCKHUNT_PATH "%DH_PATH%" >nul
+
+REM Criar o executavel duckhunt.bat no diretorio para rodar o app globalmente
+IF NOT EXIST "%DH_PATH%\duckhunt.bat" (
+    ECHO @ECHO OFF> "%DH_PATH%\duckhunt.bat"
+    ECHO CD /D "%%~dp0">> "%DH_PATH%\duckhunt.bat"
+    ECHO CALL start.bat>> "%DH_PATH%\duckhunt.bat"
+)
+
+REM Adicionar o diretorio ao PATH do usuario de forma segura (se ainda nao estiver)
+powershell -Command "$p = [Environment]::GetEnvironmentVariable('PATH', 'User'); if ($p -notmatch [regex]::Escape('%DH_PATH%')) { [Environment]::SetEnvironmentVariable('PATH', $p + ';%DH_PATH%', 'User'); Write-Host 'Duckhunt adicionado ao PATH do usuario. Reinicie o terminal para usar o comando duckhunt de qualquer lugar.' }"
+REM -----------------------------------------
+
 REM Configura variaveis do MinGW
 SET "MINGW_HOME=%~dp0mingw64"
 SET "PATH=%MINGW_HOME%\bin;%PATH%"

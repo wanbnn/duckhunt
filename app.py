@@ -249,10 +249,12 @@ You have **tools (Tools / Function Calling)** to interact with the system.
 </tool_call>
 ```
 
-3. **NEVER** write standalone terminal commands or scripts asking the user to copy and paste them. **Execute them yourself.**
-4. **Call the tool, wait for the result**, and if additional context is needed, **read the file first before proceeding.**
-5. **Thinking Process:** You **MUST ALWAYS** start your response with a `<think>...</think>` block. Inside this block, you should:
+4. **NEVER** write standalone terminal commands or scripts asking the user to copy and paste them. **Execute them yourself.**
+5. **Call the tool, wait for the result**, and if additional context is needed, **read the file first before proceeding.**
+6. **STRICT FOCUS (DO NOT OVER-EXPLORE):** Only read the files specifically related to the user's request. If directed to a specific file or task, do NOT read unrelated files, databases, or the entire directory. Your context window is limited; reading too much will cause you to forget instructions and fail.
+7. **Thinking Process:** You **MUST ALWAYS** start your response with a `<think>...</think>` block. Inside this block, you should:
    - Analyze the user's request.
+   - Ask yourself: "Do I really need to read this file to accomplish the immediate task?" If no, skip it.
    - Plan the necessary steps.
    - Decide which tools to use.
    - Review the results of previous actions.
@@ -709,6 +711,7 @@ def compor_prompt_sistema(agent_prompt_text: str, skills_prompts: list) -> str:
 1. You have tools available to perform actions (read/write files, run commands, etc.). You MUST use these tools to execute your tasks. NEVER ask the user to copy/paste code into files. ALWAYS use the tools to create or edit files yourself.
 2. If multiple MCP servers provide tools with similar names, the system may have prefixed them (e.g., ducktools_create_file). ALWAYS use the exact tool name provided in your tools schema.
 3. Call the tool, wait for the result, and if additional context is needed, read the file first before proceeding.
+4. **STRICT FOCUS (DO NOT OVER-EXPLORE):** Only read the files absolutely necessary to complete the user's request. If the user asks to modify a specific file, DO NOT read the entire project, databases, or unrelated files. Focus immediately on the target.
 """
     if "### ABSOLUTE RULES" not in partes[0] and "SYSTEM CAPABILITIES & RULES" not in partes[0]:
         partes.append(essential_rules)
@@ -1602,7 +1605,7 @@ async def run_multi_agents(llm, tools, workspace_dir, mcp_sessions, mcp_tools, m
                 sys_prompt = f"{custom_base_sys}\n\n[Você é o '{name}' nesta rodada da equipe. Lembre-se, use [TASK_COMPLETED] se a missão de todos já estiver concluída e finalizada no projeto.]"
                 msgs = [{"role": "system", "content": sys_prompt}]
                 msgs.extend(shared_history)
-                current_msgs = get_safe_truncated_messages(msgs, 0.75)
+                current_msgs = get_safe_truncated_messages(msgs, 1.0)
                 streams.append(agentes_models[i].create_chat_completion(messages=current_msgs, tools=tools, tool_choice="auto", max_tokens=2048, stream=True))
 
             async def consume_stream(i, generator):
@@ -1765,7 +1768,12 @@ async def run_multi_agents(llm, tools, workspace_dir, mcp_sessions, mcp_tools, m
                                 shared_history.append({"role": "tool", "name": tname, "content": f"Erro: MCP inativo", "tool_call_id": tc.get("id")})
                         except json.JSONDecodeError as e:
                             agent_texts[i] += f"\n[{C_ERROR}]✗ {tname}: JSON incompleto[/{C_ERROR}]\n"
-                            err_msg = f"Error: The JSON arguments for tool '{tname}' were incomplete/malformed due to a generation interruption (JSONDecodeError: {str(e)}). Please continue generating from where you left off or fix the tool call."
+                            
+                            # Conserta o JSON quebrado na mensagem do assistente
+                            malformed_str = tc["function"].get("arguments", "")
+                            tc["function"]["arguments"] = json.dumps({"_error": "malformed JSON omitted"})
+                            
+                            err_msg = f"Error: The JSON arguments for tool '{tname}' were incomplete/malformed (JSONDecodeError: {str(e)}). Original args started with: {malformed_str[:100]}... Please rewrite your previous tool call correctly and completely."
                             shared_history.append({"role": "tool", "name": tname, "content": err_msg, "tool_call_id": tc.get("id")})
                         except Exception as e:
                             agent_texts[i] += f"\n[{C_ERROR}]✗ {tname}: {e}[/{C_ERROR}]\n"
@@ -2114,14 +2122,9 @@ async def run_chat_loop():
                     
                     # Executa a geração em uma thread para não bloquear o Asyncio
                     tentativas_api = 0
+                    ctx_percent = 1.0  # Por padrão, usa 100% do contexto atual
+
                     while True:
-                        if tentativas_api == 0:
-                            ctx_percent = 0.75
-                        elif tentativas_api == 1:
-                            ctx_percent = 0.45
-                        else:
-                            ctx_percent = 0.25
-                            
                         current_msgs = get_safe_truncated_messages(messages, ctx_percent)
 
                         try:
@@ -2137,12 +2140,19 @@ async def run_chat_loop():
                                 notify_warning = f"Aviso de Contexto ({err_str[:60]}...)."
                                 console.print(f"[bold {C_WARNING}]⚠ {notify_warning}[/bold {C_WARNING}]")
                                 
-                                # Preserve ONLY the system prompt (index 0) and the most recent user request (the last one)
-                                if len(messages) > 2:
+                                if ctx_percent > 0.5:
+                                    console.print(f"[{C_DIM}]Reduzindo contexto para 50%...[/{C_DIM}]")
+                                    ctx_percent = 0.5
+                                    continue
+                                elif ctx_percent > 0.25:
+                                    console.print(f"[{C_DIM}]Reduzindo contexto para 25%...[/{C_DIM}]")
+                                    ctx_percent = 0.25
+                                    continue
+                                elif len(messages) > 2:
                                     console.print(f"[{C_DIM}]Limpando histórico de contexto para reiniciar a conversa...[/{C_DIM}]")
                                     # Keep [system_prompt, latest_user_message]
                                     messages = [messages[0], messages[-1]]
-                                    # Reset API retries after context trim
+                                    ctx_percent = 1.0
                                     tentativas_api = 0
                                     continue
                                 else:
@@ -2155,11 +2165,18 @@ async def run_chat_loop():
                                             message = {"role": "assistant", "content": "Geração cancelada pelo usuário.", "tool_calls": []}
                                             break
                                         tentativas_api = 0
+                                        ctx_percent = 1.0
                                         continue
                                     else:
                                         message = {"role": "assistant", "content": f"Erro não resolvido: {str(loop_e)}", "tool_calls": []}
                                         break
                                         
+                            # Fail fast for 400 Bad Request to prevent useless retries
+                            if "400" in err_str:
+                                notify_error(f"Erro 400 (Bad Request) da API: {loop_e}")
+                                message = {"role": "assistant", "content": f"A API rejeitou a requisição (Erro 400).\nDetalhes: {str(loop_e)}\n\nIsso geralmente ocorre por parâmetros inválidos ou erro estrutural na chamada. Tente refazer a instrução de uma forma diferente.", "tool_calls": []}
+                                break
+
                             # General Retry (429, timeouts, connections, 502, 503, peer closed, etc.)
                             if tentativas_api < 2:
                                 notify_warning = f"Falha na comunicação com API ({str(loop_e)[:60]}...)."
@@ -2169,8 +2186,7 @@ async def run_chat_loop():
                                 # Wait for 30 seconds with a live countdown
                                 with Live(console=console, refresh_per_second=1) as live:
                                     for rem in range(30, 0, -1):
-                                        next_perc = 45 if tentativas_api == 0 else 25
-                                        live.update(Text(f"  Retentando em {rem}s com {next_perc}% do contexto (Tentativa {tentativas_api + 2}/3)...", style=f"bold {C_WARNING}"))
+                                        live.update(Text(f"  Retentando em {rem}s (Tentativa {tentativas_api + 2}/3)...", style=f"bold {C_WARNING}"))
                                         await asyncio.sleep(1)
                                 tentativas_api += 1
                                 continue
@@ -2194,8 +2210,12 @@ async def run_chat_loop():
                                 notify_warning = f"A resposta do modelo foi interrompida (JSON incompleto na ferramenta '{tool_name}'). Solicitando continuação..."
                                 console.print(f"[bold {C_WARNING}]⚠ {notify_warning}[/bold {C_WARNING}]")
                                 
+                                # Conserta o JSON quebrado na mensagem do assistente para evitar erro 400 (Bad Request)
+                                malformed_str = tool_call["function"].get("arguments", "")
+                                tool_call["function"]["arguments"] = json.dumps({"_error": "malformed JSON omitted"})
+                                
                                 # Simula um resultado de erro da ferramenta para forçar o modelo a continuar
-                                error_msg = f"Error: The JSON arguments for tool '{tool_name}' were incomplete/malformed due to a generation interruption (JSONDecodeError: {str(e)}). Please continue generating from where you left off or fix the tool call."
+                                error_msg = f"Error: The JSON arguments for tool '{tool_name}' were incomplete/malformed (JSONDecodeError: {str(e)}). Original args started with: {malformed_str[:100]}... The malformed arguments were omitted from history to prevent API errors. Please rewrite your previous tool call correctly and completely."
                                 messages.append({
                                     "role": "tool", 
                                     "name": tool_name, 
